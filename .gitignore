@@ -1,6 +1,6 @@
-# =========================
-# DATASETS (RAW ONLY)
-# =========================
+
+# DATASETS 
+
 data/deap/
 data/raw/
 *.dat
@@ -9,29 +9,29 @@ data/raw/
 *.pkl
 *.h5
 
-# =========================
+
 # PYTHON CACHE
-# =========================
+
 __pycache__/
 *.pyc
 *.pyo
 *.pyd
 
-# =========================
+
 # VENV
-# =========================
+
 venv/
 .env/
 
-# =========================
+
 # EXPERIMENTS / OUTPUTS
-# =========================
+
 experiments/
 outputs/
 logs/
 
-# =========================
+
 # OS FILES
-# =========================
+
 .DS_Store
 Thumbs.db
