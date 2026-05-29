@@ -1,16 +1,36 @@
-# Python cache
+# =========================
+# DATASETS (CRITICAL)
+# =========================
+data/
+*.dat
+*.npy
+*.npz
+*.pkl
+*.h5
+
+# =========================
+# PYTHON CACHE
+# =========================
 __pycache__/
 *.pyc
 *.pyo
 *.pyd
 
-# Dataset
-data/deap/
+# =========================
+# VENV
+# =========================
+venv/
+.env/
 
-# Experiments
-experiments/*.csv
-experiments/*.db
+# =========================
+# EXPERIMENTS / OUTPUTS
+# =========================
+experiments/
+outputs/
+logs/
 
-# OS
+# =========================
+# OS FILES
+# =========================
 .DS_Store
 Thumbs.db
