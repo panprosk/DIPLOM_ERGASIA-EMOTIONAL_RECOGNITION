@@ -1,7 +1,8 @@
 # =========================
-# DATASETS (CRITICAL)
+# DATASETS (RAW ONLY)
 # =========================
-data/
+data/deap/
+data/raw/
 *.dat
 *.npy
 *.npz
