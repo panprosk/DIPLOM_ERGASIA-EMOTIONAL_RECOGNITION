@@ -9,11 +9,12 @@ dataset.py
 import numpy as np
 import torch
 from torch.utils.data import Dataset, DataLoader
+from .feature_extractor import FeatureExtractor
 
 
 SAMPLING_RATE   = 128
-WINDOW_SEC      = 4
-OVERLAP_RATIO   = 0.5
+WINDOW_SEC      = 6     # ΑΥΞΗΘΗΚΕ ΑΠΟ 4
+OVERLAP_RATIO   = 0.75  # ΑΥΞΗΘΗΚΕ ΑΠΟ 0.5
 VALENCE_THRESH  = 5.0
 
 
@@ -68,7 +69,11 @@ def segment_trials(signals: dict,
     step_samples   = int(window_samples * (1 - overlap))
     binary_labels  = make_binary_labels(signals["labels"])
 
-    all_eeg, all_eda, all_ppg, all_y = [], [], [], []
+    all_eeg, all_eda, all_ppg = [], [], []
+    all_eeg_feat, all_eda_feat, all_ppg_feat = [], [], []
+    all_y = []
+    
+    feature_extractor = FeatureExtractor()
 
     for trial_idx in range(signals["eeg"].shape[0]):
         eeg_trial = signals["eeg"][trial_idx]
@@ -76,21 +81,35 @@ def segment_trials(signals: dict,
         ppg_trial = signals["ppg"][trial_idx]
         label     = binary_labels[trial_idx]
 
+        # Raw windows
         eeg_wins = segment_signal(eeg_trial, window_samples, step_samples)
         eda_wins = segment_signal(eda_trial, window_samples, step_samples)
         ppg_wins = segment_signal(ppg_trial, window_samples, step_samples)
+
+        # Handcrafted features
+        eeg_feat = feature_extractor.extract_features(eeg_wins, modality="eeg")
+        eda_feat = feature_extractor.extract_features(eda_wins, modality="eda")
+        ppg_feat = feature_extractor.extract_features(ppg_wins, modality="ppg")
 
         n_wins = eeg_wins.shape[0]
 
         all_eeg.append(eeg_wins)
         all_eda.append(eda_wins)
         all_ppg.append(ppg_wins)
+        
+        all_eeg_feat.append(eeg_feat)
+        all_eda_feat.append(eda_feat)
+        all_ppg_feat.append(ppg_feat)
+        
         all_y.extend([label] * n_wins)
 
     return (
         np.concatenate(all_eeg, axis=0),
         np.concatenate(all_eda, axis=0),
         np.concatenate(all_ppg, axis=0),
+        np.concatenate(all_eeg_feat, axis=0),
+        np.concatenate(all_eda_feat, axis=0),
+        np.concatenate(all_ppg_feat, axis=0),
         np.array(all_y, dtype=np.int64),
     )
 
@@ -147,17 +166,20 @@ class DEAPDataset(Dataset):
 
         for sid in subject_ids:
             signals = all_subjects[sid]
-            eeg_wins, eda_wins, ppg_wins, y = segment_trials(
+            eeg_wins, eda_wins, ppg_wins, eeg_feat, eda_feat, ppg_feat, y = segment_trials(
                 signals, window_sec=window_sec, overlap=overlap, fs=fs
             )
 
             for i in range(len(y)):
-                self.samples.append((
-                    torch.tensor(eeg_wins[i], dtype=torch.float32),
-                    torch.tensor(eda_wins[i], dtype=torch.float32),
-                    torch.tensor(ppg_wins[i], dtype=torch.float32),
-                    torch.tensor(y[i],        dtype=torch.long),
-                ))
+                self.samples.append({
+                    "eeg_raw": torch.tensor(eeg_wins[i], dtype=torch.float32),
+                    "eda_raw": torch.tensor(eda_wins[i], dtype=torch.float32),
+                    "ppg_raw": torch.tensor(ppg_wins[i], dtype=torch.float32),
+                    "eeg_feat": torch.tensor(eeg_feat[i], dtype=torch.float32),
+                    "eda_feat": torch.tensor(eda_feat[i], dtype=torch.float32),
+                    "ppg_feat": torch.tensor(ppg_feat[i], dtype=torch.float32),
+                    "label": torch.tensor(y[i], dtype=torch.long),
+                })
 
         print(f"  Dataset size: {len(self.samples)} windows")
 
@@ -165,8 +187,7 @@ class DEAPDataset(Dataset):
         return len(self.samples)
 
     def __getitem__(self, idx):
-        eeg, eda, ppg, label = self.samples[idx]
-        return {"eeg": eeg, "eda": eda, "ppg": ppg, "label": label}
+        return self.samples[idx]
 
 
 # ──────────────────────────────────────────────

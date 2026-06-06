@@ -15,7 +15,13 @@ import torch
 import torch.nn as nn
 
 from tqdm import tqdm
-from sklearn.metrics import accuracy_score, f1_score
+
+from sklearn.metrics import (
+    accuracy_score,
+    f1_score,
+    classification_report,
+    confusion_matrix,
+)
 
 from data.deap_loader import load_all_subjects
 from data.preprocessing import preprocess_subject
@@ -24,7 +30,6 @@ from data.dataset import (
     build_dataloaders,
 )
 
-# IMPORTANT:
 from models.baseline_cnn_mlp import HybridCNNMLP
 
 
@@ -39,9 +44,9 @@ DEVICE = torch.device(
 )
 
 BATCH_SIZE = 64
-EPOCHS = 20
+EPOCHS = 50 # ΑΥΞΗΘΗΚΕ
 
-LR = 3e-4
+LR = 1e-4 # Μειωμένο Learning Rate
 WEIGHT_DECAY = 1e-3
 
 SEED = 42
@@ -145,6 +150,7 @@ def evaluate(
     model,
     loader,
     criterion,
+    return_predictions=False,
 ):
 
     model.eval()
@@ -175,7 +181,9 @@ def evaluate(
         preds = torch.argmax(
             logits,
             dim=1
+            
         )
+        
 
         all_preds.extend(
             preds.cpu().numpy()
@@ -194,6 +202,16 @@ def evaluate(
         all_targets,
         all_preds
     )
+
+    if return_predictions:
+
+        return (
+            running_loss / len(loader),
+            acc,
+            f1,
+            np.array(all_targets),
+            np.array(all_preds),
+        )
 
     return (
         running_loss / len(loader),
@@ -251,7 +269,7 @@ def main():
 
     train_ids, val_ids, test_ids = subject_wise_split(subjects)
 
-    # -----------------------------------------------------
+        # -----------------------------------------------------
     # DATALOADERS
     # -----------------------------------------------------
 
@@ -267,21 +285,59 @@ def main():
     )
 
     # -----------------------------------------------------
+    # CLASS DISTRIBUTION CHECK
+    # -----------------------------------------------------
+
+    print("\nChecking class distribution...")
+
+    train_labels = []
+    for batch in train_loader:
+        train_labels.extend(batch["label"].numpy())
+    train_labels = np.array(train_labels)
+
+    train_class0_count = (train_labels == 0).sum()
+    train_class1_count = (train_labels == 1).sum()
+    total_train_samples = train_class0_count + train_class1_count
+
+    weight_class0 = total_train_samples / (2.0 * train_class0_count)
+    weight_class1 = total_train_samples / (2.0 * train_class1_count)
+    class_weights = torch.tensor([weight_class0, weight_class1], dtype=torch.float32).to(DEVICE)
+
+    print(f"Train: class0={train_class0_count} class1={train_class1_count}")
+    print(f"Class weights: {class_weights.tolist()}")
+
+    for name, loader in [
+        ("Val", val_loader),
+        ("Test", test_loader),
+    ]:
+        labels = []
+        for batch in loader:
+            labels.extend(batch["label"].numpy())
+        labels = np.array(labels)
+        print(
+            f"{name}: "
+            f"class0={(labels==0).sum()} "
+            f"class1={(labels==1).sum()}"
+        )
+
+    # -----------------------------------------------------
     # MODEL
     # -----------------------------------------------------
 
     print("\n[5] Building model...")
 
+    feature_dims = {
+        "eeg": 352,
+        "eda": 8,
+        "ppg": 8
+    }
+
     model = HybridCNNMLP(
-
         signals=["EEG"],
-
-        cnn_out_dim=64,
-
-        hidden_dim=128,
-
-        dropout=0.5,
-
+        feature_dims=feature_dims,
+        cnn_out_dim=128,
+        hidden_dim=256,
+        dropout=0.2,
     ).to(DEVICE)
 
     print(model)
@@ -299,7 +355,12 @@ def main():
         weight_decay=WEIGHT_DECAY,
     )
 
+    scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(
+        optimizer, mode='min', factor=0.5, patience=3
+    )
+
     criterion = nn.CrossEntropyLoss(
+        weight=class_weights,  # ΕΦΑΡΜΟΓΗ ΒΑΡΩΝ ΚΛΑΣΕΩΝ
         label_smoothing=0.1
     )
 
@@ -310,6 +371,9 @@ def main():
     print("\n[6] Training...\n")
 
     best_val_f1 = 0.0
+
+    patience = 10  # ΑΥΞΗΘΗΚΕ
+    patience_counter = 0
 
     for epoch in range(EPOCHS):
 
@@ -326,6 +390,8 @@ def main():
             criterion,
         )
 
+        scheduler.step(val_loss) # ΕΝΗΜΕΡΩΣΗ SCHEDULER
+
         print(
             f"Epoch {epoch+1:02d}/{EPOCHS} | "
             f"Train Loss: {train_loss:.4f} | "
@@ -339,6 +405,7 @@ def main():
         if val_f1 > best_val_f1:
 
             best_val_f1 = val_f1
+            patience_counter = 0
 
             torch.save(
                 model.state_dict(),
@@ -350,6 +417,20 @@ def main():
                 f"(F1={val_f1:.4f})"
             )
 
+        else:
+
+            patience_counter += 1
+
+            print(
+                f"  No improvement "
+                f"({patience_counter}/{patience})"
+            )
+
+            if patience_counter >= patience:
+
+                print("\nEarly stopping triggered.")
+                break
+
     # -----------------------------------------------------
     # TEST
     # -----------------------------------------------------
@@ -357,13 +438,23 @@ def main():
     print("\n[7] Final Test Evaluation...")
 
     model.load_state_dict(
-        torch.load("best_baseline.pt")
+        torch.load(
+            "best_baseline.pt",
+            map_location=DEVICE
+        )
     )
 
-    test_loss, test_acc, test_f1 = evaluate(
+    (
+        test_loss,
+        test_acc,
+        test_f1,
+        y_true,
+        y_pred,
+    ) = evaluate(
         model,
         test_loader,
         criterion,
+        return_predictions=True,
     )
 
     print("\n" + "=" * 60)
@@ -373,6 +464,23 @@ def main():
     print(f"Test Loss : {test_loss:.4f}")
     print(f"Test Acc  : {test_acc:.4f}")
     print(f"Test F1   : {test_f1:.4f}")
+
+    print("\nClassification Report")
+    print(
+        classification_report(
+            y_true,
+            y_pred,
+            digits=4
+        )
+    )
+
+    print("\nConfusion Matrix")
+    print(
+        confusion_matrix(
+            y_true,
+            y_pred
+        )
+    )
 
     print("\nSaved:")
     print("best_baseline.pt")
