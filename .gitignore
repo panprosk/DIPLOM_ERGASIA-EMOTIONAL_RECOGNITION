@@ -21,7 +21,12 @@ __pycache__/
 # VENV
 
 venv/
+.venv/
 .env/
+
+# LOCAL THESIS NOTES (keep dependency file trackable)
+*.txt
+!requirements.txt
 
 
 # EXPERIMENTS / OUTPUTS
