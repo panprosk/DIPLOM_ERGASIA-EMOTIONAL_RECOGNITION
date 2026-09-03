@@ -143,6 +143,16 @@ def test_gradient_flow_and_training_step():
     out = model(eeg, physio)
     loss_before = criterion(out["logits"], labels)
 
+    # Συμπεριλαμβάνουμε και το Supervised Contrastive loss ώστε το
+    # contrastive_projection head (χρησιμοποιείται μόνο μέσω αυτού του
+    # loss, όχι από το classification loss) να λάβει επίσης gradient.
+    from src.models.supervised_contrastive_loss import SupervisedContrastiveLoss
+
+    contrastive_loss_fn = SupervisedContrastiveLoss(temperature=0.07)
+    contrastive_loss = contrastive_loss_fn(out["contrastive_embedding"], labels)
+
+    loss_before = loss_before + 0.2 * contrastive_loss
+
     optimizer.zero_grad()
     loss_before.backward()
 

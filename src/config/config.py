@@ -79,6 +79,14 @@ class Config:
     # (Gradient Reversal Layer). Χρησιμοποιείται με γραμμικό ramp-up
     # στα πρώτα epochs (DANN-style schedule) ώστε ο encoder να μην
     # "μπερδεύεται" υπερβολικά νωρίς στην εκπαίδευση.
+    #
+    # ΣΗΜΕΙΩΣΗ: δοκιμάστηκε αύξηση σε 0.75 (μαζί με adversarial_weight
+    # 0.50 και ταχύτερο ramp-up) με στόχο πιο subject-invariant
+    # embeddings, αλλά το αποτέλεσμα ήταν χειρότερο (Trial F1 0.5833
+    # -> 0.4397, Worst Subject F1 0.3220 -> 0.3012). Ο subject
+    # classifier loss κόλλησε στο θεωρητικό μέγιστο (~ln(22)=3.09),
+    # δηλαδή ο encoder έγινε τόσο subject-invariant που έχασε χρήσιμη
+    # πληροφορία και για το ίδιο το emotion task. Επαναφορά στο 0.30.
     ADVERSARIAL_LAMBDA_MAX: float = 0.30
 
     # ----------------------------------------------------------------
@@ -125,6 +133,14 @@ class Config:
     EDA_GAUSSIAN_SIGMA: float = 1.0
 
     SUBJECT_WISE_NORMALIZATION: bool = True
+
+    # Τα πρώτα 3 δευτερόλεπτα κάθε DEAP trial είναι pre-stimulus
+    # ("ήρεμη") καταγραφή, πριν ξεκινήσει το video. Αφαιρούμε τον μέσο
+    # όρο αυτού του τμήματος (ανά trial/κανάλι) από το υπόλοιπο σήμα
+    # πριν το windowing/labeling (βλ. src/preprocessing/baseline_correction.py).
+    BASELINE_SECONDS: float = 3.0
+
+    BASELINE_SAMPLES: int = int(BASELINE_SECONDS * SAMPLING_RATE)
 
     # ==========================================================
     # FEATURES
@@ -186,6 +202,18 @@ class Config:
     WEIGHT_DECAY: float = 5e-4
 
     DROPOUT: float = 0.30
+
+    # ΣΗΜΕΙΩΣΗ: δοκιμάστηκε χαμηλότερο TRANSFORMER_DROPOUT=0.20 με την
+    # υπόθεση ότι το dropout=0.30 πάνω στα attention weights προκαλούσε
+    # "κατάρρευση" σε ομοιόμορφη κατανομή. Αποδείχτηκε ότι ο δείκτης
+    # που το έδειχνε αυτό (cross_attn_mean) ήταν μαθηματικά λανθασμένος
+    # (mean πάνω σε softmax που αθροίζει σε 1 είναι ΠΑΝΤΑ 1/num_keys,
+    # ανεξαρτήτως αν η προσοχή είναι πραγματικά ομοιόμορφη) -- διορθώθηκε
+    # στο cross_attention_transformer.py (τώρα μετράει max attention
+    # weight ανά query). Το χαμηλότερο dropout=0.20 απλά αύξησε το
+    # overfitting (Test Trial F1 έπεσε από 0.5576 -> 0.4630), άρα
+    # επαναφέρθηκε στο 0.30 (ίδιο με το Hybrid CNN-MLP).
+    TRANSFORMER_DROPOUT: float = 0.30
 
     EARLY_STOPPING_PATIENCE: int = 15
 

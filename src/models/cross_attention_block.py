@@ -28,14 +28,33 @@ class CrossAttentionBlock(nn.Module):
     να αναλύσει πόσο "κοιτάει" κάθε modality το άλλο.
     """
 
-    def __init__(self, d_model: int = 64, num_heads: int = 4, dropout: float = 0.30):
+    def __init__(
+        self,
+        d_model: int = 64,
+        num_heads: int = 4,
+        dropout: float = 0.30,
+        attn_dropout: float | None = None,
+    ):
         super().__init__()
 
+        # ΣΗΜΕΙΩΣΗ (ενημερωμένη): δοκιμάστηκε χαμηλότερο attn_dropout=0.10
+        # στο MultiheadAttention με την υπόθεση ότι το dropout=0.30 πάνω
+        # στα attention weights προκαλούσε "κατάρρευση" σε ομοιόμορφη
+        # κατανομή. Αποδείχτηκε όμως ότι ο δείκτης diagnostics που το
+        # έδειχνε (mean πάνω σε softmax row) ήταν μαθηματικά ΠΑΝΤΑ
+        # 1/num_keys ανεξαρτήτως πραγματικής κατανομής (διορθώθηκε στο
+        # cross_attention_transformer.py). Το χαμηλότερο dropout απλά
+        # αύξησε το overfitting και χειροτέρεψε το αποτέλεσμα, άρα το
+        # attn_dropout επαναφέρεται στο ίδιο με το γενικό dropout
+        # (default attn_dropout=None -> χρησιμοποιεί την τιμή του dropout).
+        if attn_dropout is None:
+            attn_dropout = dropout
+
         self.eeg_attends_physio = nn.MultiheadAttention(
-            embed_dim=d_model, num_heads=num_heads, dropout=dropout, batch_first=True
+            embed_dim=d_model, num_heads=num_heads, dropout=attn_dropout, batch_first=True
         )
         self.physio_attends_eeg = nn.MultiheadAttention(
-            embed_dim=d_model, num_heads=num_heads, dropout=dropout, batch_first=True
+            embed_dim=d_model, num_heads=num_heads, dropout=attn_dropout, batch_first=True
         )
 
         self.eeg_norm1 = nn.LayerNorm(d_model)

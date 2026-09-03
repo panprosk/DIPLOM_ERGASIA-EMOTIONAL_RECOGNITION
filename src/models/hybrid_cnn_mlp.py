@@ -1,5 +1,6 @@
 import torch
 import torch.nn as nn
+import torch.nn.functional as F
 
 from src.models.eeg_cnn_encoder import EEGCNNEncoder
 from src.models.eeg_handcrafted_encoder import EEGHandcraftedEncoder
@@ -120,6 +121,18 @@ class HybridCNNMLP(nn.Module):
             nn.Linear(embedding_dim // 2, num_classes),
         )
 
+        # --- Supervised Contrastive projection head ---
+        # Ξεχωριστό, μικρό MLP που προβάλλει το fused embedding σε
+        # έναν contrastive χώρο (SimCLR/SupCon-style). Αποσυνδέεται
+        # από τον classifier ώστε το contrastive loss να ενθαρρύνει
+        # label-discriminative, subject-agnostic αναπαραστάσεις χωρίς
+        # να περιορίζει άμεσα το classification head.
+        self.contrastive_projection = nn.Sequential(
+            nn.Linear(embedding_dim, embedding_dim),
+            nn.ReLU(inplace=True),
+            nn.Linear(embedding_dim, 64),
+        )
+
         # --- Προαιρετικός Domain-Adversarial Subject Classifier ---
         if num_subjects is not None and num_subjects > 0:
 
@@ -188,11 +201,16 @@ class HybridCNNMLP(nn.Module):
 
         probs = torch.softmax(logits, dim=-1)
 
+        contrastive_embedding = F.normalize(
+            self.contrastive_projection(normalized), p=2, dim=-1
+        )
+
         output = {
             "logits": logits,
             "probs": probs,
             "eeg_embedding": eeg_embedding,
             "physio_embedding": physio_embedding,
+            "contrastive_embedding": contrastive_embedding,
             "eeg_gate": eeg_gate.mean(dim=-1),
             "physio_gate": 1.0 - eeg_gate.mean(dim=-1),
         }

@@ -1,10 +1,12 @@
 import torch
 import torch.nn as nn
+import torch.nn.functional as F
 
 from src.models.patch_embedding import PatchEmbedding
 from src.models.positional_encoding import SinusoidalPositionalEncoding
 from src.models.cross_attention_block import CrossAttentionBlock
 from src.models.gradient_reversal import GradientReversalLayer
+from src.models.channel_attention import ChannelAttention
 
 
 class CrossAttentionTransformer(nn.Module):
@@ -71,6 +73,15 @@ class CrossAttentionTransformer(nn.Module):
     ):
         super().__init__()
 
+        # Channel Attention πάνω στα raw EEG ηλεκτρόδια (πριν το patch
+        # embedding) -- ίδια ιδέα/υλοποίηση με το Hybrid CNN-MLP (SE-style,
+        # Squeeze-and-Excitation), ώστε το μοντέλο να μάθει ποια EEG
+        # κανάλια είναι πιο emotion-discriminative. Στο Hybrid CNN-MLP
+        # αυτό έδωσε μικρή αλλά συνεπή βελτίωση χωρίς κόστος σε απόδοση.
+        self.eeg_channel_attention = ChannelAttention(
+            num_channels=eeg_channels, reduction=4
+        )
+
         self.eeg_patch_embed = PatchEmbedding(
             in_channels=eeg_channels, d_model=d_model, patch_size=patch_size,
         )
@@ -119,6 +130,16 @@ class CrossAttentionTransformer(nn.Module):
             nn.Linear(embedding_dim, num_classes),
         )
 
+        # --- Supervised Contrastive projection head ---
+        # Ίδια ιδέα με το Hybrid CNN-MLP: ξεχωριστό, μικρό MLP που
+        # προβάλλει το fused embedding σε contrastive χώρο (SimCLR/
+        # SupCon-style), αποσυνδεδεμένο από τον classifier.
+        self.contrastive_projection = nn.Sequential(
+            nn.Linear(embedding_dim * 2, embedding_dim),
+            nn.ReLU(inplace=True),
+            nn.Linear(embedding_dim, 64),
+        )
+
         # --- Προαιρετικός Domain-Adversarial Subject Classifier ---
         if num_subjects is not None and num_subjects > 0:
 
@@ -162,6 +183,8 @@ class CrossAttentionTransformer(nn.Module):
 
         physio = torch.cat([eda, ppg], dim=1)   # (batch, 2, window_samples)
 
+        eeg = self.eeg_channel_attention(eeg)
+
         eeg_tokens = self.eeg_patch_embed(eeg)
         eeg_tokens = self.eeg_pos_encoding(eeg_tokens)
         eeg_tokens = self.eeg_self_attention(eeg_tokens)
@@ -183,10 +206,21 @@ class CrossAttentionTransformer(nn.Module):
         logits = self.classifier(fused)
         probs = torch.softmax(logits, dim=-1)
 
-        # Μέσο attention weight (πάνω σε query-tokens και key-tokens) ως
-        # ερμηνεύσιμος δείκτης "πόσο εμπιστεύεται" το EEG το physio branch.
+        contrastive_embedding = F.normalize(
+            self.contrastive_projection(fused), p=2, dim=-1
+        )
+
+        # ΔΙΟΡΘΩΣΗ: το mean(dim=(1,2)) πάνω σε ένα softmax attention matrix
+        # (κάθε γραμμή/query αθροίζει σε 1) είναι ΠΑΝΤΑ μαθηματικά ίσο με
+        # 1/num_keys, ΑΝΕΞΑΡΤΗΤΑ από το αν η κατανομή είναι ομοιόμορφη ή
+        # πολύ "αιχμηρή" -- ήταν λανθασμένος/άχρηστος δείκτης diagnostics
+        # (γι' αυτό έμενε σταθερό σε 0.0417=1/24 σε όλα τα epochs, ό,τι κι
+        # αν μάθαινε πραγματικά το μοντέλο). Αντ' αυτού χρησιμοποιούμε το
+        # ΜΕΓΙΣΤΟ attention weight ανά query (μέσος όρος πάνω σε queries):
+        # αν είναι κοντά στο 1/num_keys -> σχεδόν ομοιόμορφη προσοχή,
+        # αν είναι σαφώς μεγαλύτερο -> το μοντέλο "εστιάζει" επιλεκτικά.
         cross_attention_weight = (
-            cross_attn_weight.mean(dim=(1, 2))
+            cross_attn_weight.max(dim=2).values.mean(dim=1)
             if cross_attn_weight is not None
             else torch.zeros(eeg.size(0), device=eeg.device)
         )
@@ -196,6 +230,7 @@ class CrossAttentionTransformer(nn.Module):
             "probs": probs,
             "eeg_embedding": eeg_embedding,
             "physio_embedding": physio_embedding,
+            "contrastive_embedding": contrastive_embedding,
             "cross_attention_weight": cross_attention_weight,
         }
 

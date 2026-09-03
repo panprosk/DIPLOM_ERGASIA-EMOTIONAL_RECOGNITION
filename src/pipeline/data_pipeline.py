@@ -12,6 +12,7 @@ from src.data.subject_manager import SubjectManager
 from src.data.label_generator import LabelGenerator
 from src.split.subject_split import SubjectSplitter
 from src.preprocessing.preprocessing_pipeline import PreprocessingPipeline
+from src.preprocessing.baseline_correction import remove_trial_baseline
 from src.segmentation.window_segmenter import WindowSegmenter
 from src.features.feature_extractor import FeatureExtractor
 from src.features.feature_scaler import FeatureScaler
@@ -251,6 +252,16 @@ class DataPipeline:
                         eeg_data = raw_data[:, :32, :]
                         eda_data = raw_data[:, EDA_CHANNEL:EDA_CHANNEL + 1, :]
                         ppg_data = raw_data[:, PPG_CHANNEL:PPG_CHANNEL + 1, :]
+
+                        # Per-trial pre-stimulus baseline correction: αφαιρεί
+                        # τον μέσο όρο του pre-stimulus (πρώτα BASELINE_SAMPLES)
+                        # τμήματος από κάθε trial και πετάει έξω αυτό το
+                        # τμήμα (δεν αντιστοιχεί στο emotion label του trial).
+                        baseline_samples = self.config.BASELINE_SAMPLES
+
+                        eeg_data = remove_trial_baseline(eeg_data, baseline_samples)
+                        eda_data = remove_trial_baseline(eda_data, baseline_samples)
+                        ppg_data = remove_trial_baseline(ppg_data, baseline_samples)
                     else:
                         eeg_data = data.get("eeg")
                         eda_data = data.get("eda")

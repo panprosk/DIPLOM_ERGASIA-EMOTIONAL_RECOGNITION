@@ -46,7 +46,7 @@ def build_model(model_name: str, config, num_subjects: int | None = None):
             dim_feedforward=getattr(config, "TRANSFORMER_FF_DIM", 128),
             patch_size=getattr(config, "TRANSFORMER_PATCH_SIZE", 32),
             num_classes=config.NUM_CLASSES,
-            dropout=config.DROPOUT,
+            dropout=getattr(config, "TRANSFORMER_DROPOUT", 0.20),
             num_subjects=num_subjects,
         )
 

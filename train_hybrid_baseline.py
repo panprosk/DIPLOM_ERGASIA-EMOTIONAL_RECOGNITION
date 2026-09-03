@@ -52,6 +52,7 @@ from src.config.config import Config
 from src.data.deap_loader import DEAPLoader
 from src.pipeline.data_pipeline import DataPipeline
 from src.models import build_model
+from src.models.supervised_contrastive_loss import SupervisedContrastiveLoss
 from src.utils.evaluation import evaluate_hierarchical_predictions
 
 
@@ -97,6 +98,14 @@ def parse_args():
                               "(task_loss + weight * subject_loss).")
     parser.add_argument("--adversarial-lambda-max", type=float, default=None,
                          help="Overrides config.ADVERSARIAL_LAMBDA_MAX if given.")
+    parser.add_argument("--no-contrastive", action="store_true",
+                         help="Απενεργοποιεί το Supervised Contrastive loss "
+                              "πάνω στο fused embedding.")
+    parser.add_argument("--contrastive-weight", type=float, default=0.20,
+                         help="Βάρος του Supervised Contrastive loss "
+                              "(task_loss + ... + weight * contrastive_loss).")
+    parser.add_argument("--contrastive-temperature", type=float, default=0.07,
+                         help="Temperature του Supervised Contrastive loss.")
     parser.add_argument("--no-eeg-handcrafted", action="store_true",
                          help="Απενεργοποιεί το EEG handcrafted-feature "
                               "branch (χρησιμοποιεί μόνο raw-EEG CNN).")
@@ -213,6 +222,8 @@ def run_epoch(
     subject_to_idx: dict = None,
     grl_lambda: float = 0.0,
     adversarial_weight: float = 0.30,
+    contrastive_loss_fn=None,
+    contrastive_weight: float = 0.0,
     heartbeat_every: int = 20,
     heartbeat_label: str = "",
 ):
@@ -293,6 +304,14 @@ def run_epoch(
 
                 loss = task_loss + adversarial_weight * subject_loss
                 subject_loss_value = subject_loss.item()
+
+            if train and contrastive_loss_fn is not None and contrastive_weight > 0.0:
+
+                contrastive_loss = contrastive_loss_fn(
+                    out["contrastive_embedding"], labels
+                )
+
+                loss = loss + contrastive_weight * contrastive_loss
 
             if train:
                 loss.backward()
@@ -385,7 +404,7 @@ def main():
     config.LEARNING_RATE = 3e-4
     config.WEIGHT_DECAY = 1e-3
     config.DROPOUT = 0.40
-    config.EARLY_STOPPING_PATIENCE = 6
+    config.EARLY_STOPPING_PATIENCE = 10
 
     if args.batch_size is not None:
         config.BATCH_SIZE = args.batch_size
@@ -497,9 +516,22 @@ def main():
         weight_decay=config.WEIGHT_DECAY,
     )
 
+    contrastive_loss_fn = None
+    if not args.no_contrastive:
+        contrastive_loss_fn = SupervisedContrastiveLoss(
+            temperature=args.contrastive_temperature
+        )
+        print(
+            f"Supervised Contrastive: ON (weight={args.contrastive_weight}, "
+            f"temperature={args.contrastive_temperature})\n",
+            flush=True,
+        )
+    else:
+        print("Supervised Contrastive: OFF\n", flush=True)
+
     # Ακολουθεί το ίδιο metric με το checkpoint: Trial Macro-F1.
     scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(
-        optimizer, mode="max", factor=0.5, patience=2, min_lr=1e-6
+        optimizer, mode="max", factor=0.5, patience=5, min_lr=1e-6
     )
 
     header = (
@@ -526,6 +558,9 @@ def main():
         # αρχή (ο encoder μαθαίνει πρώτα τη βασική εργασία) -> lambda_max
         # μέχρι το μέσο της εκπαίδευσης, ώστε το adversarial signal να
         # μην κυριαρχεί πριν ο encoder αποκτήσει χρήσιμα embeddings.
+        # (Δοκιμάστηκε ταχύτερο ramp-up στο 1/3, αλλά μαζί με lambda_max
+        # 0.75 οδήγησε σε χειρότερα αποτελέσματα -- βλ. σημείωση στο
+        # config.ADVERSARIAL_LAMBDA_MAX. Επαναφορά στο epochs/2.)
         progress = min(1.0, (epoch - 1) / max(1, args.epochs / 2))
         grl_lambda = config.ADVERSARIAL_LAMBDA_MAX * progress if subject_to_idx else 0.0
 
@@ -534,6 +569,8 @@ def main():
             train=True, grad_clip=args.grad_clip, augment=not args.no_augment,
             subject_to_idx=subject_to_idx, grl_lambda=grl_lambda,
             adversarial_weight=args.adversarial_weight,
+            contrastive_loss_fn=contrastive_loss_fn,
+            contrastive_weight=args.contrastive_weight,
             heartbeat_label="train ",
         )
 
