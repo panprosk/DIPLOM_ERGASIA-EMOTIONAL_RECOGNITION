@@ -110,7 +110,9 @@ def parse_args():
     parser.add_argument("--seed", type=int, default=42)
     parser.add_argument("--no-augment", action="store_true",
                          help="Απενεργοποιεί το EEG data augmentation στο search.")
-    parser.add_argument("--search-profile", choices=["focused", "refine", "best_recipe"],
+    parser.add_argument("--search-profile", choices=[
+        "focused", "refine", "best_recipe", "cross_subject_v2"
+    ],
                         default="focused",
                         help="focused: στενό, evidence-based Hybrid search.")
     parser.add_argument("--objective", choices=["generalization", "trial_f1"],
@@ -154,6 +156,26 @@ def _sample_common_hparams(trial, config, profile="focused"):
         contrastive_temperature = trial.suggest_float(
             "contrastive_temperature", 0.05, 0.08
         )
+        gate_balance_weight = 0.0
+    elif profile == "cross_subject_v2" and config.MODEL_NAME == "hybrid":
+        # Evidence-based region from the historical Hybrid run, while
+        # explicitly searching the fusion imbalance observed in the latest
+        # confirmation run (EEG gate ~= 0.80).
+        config.LEARNING_RATE = trial.suggest_float("lr", 1.5e-4, 4.5e-4, log=True)
+        config.WEIGHT_DECAY = trial.suggest_float("weight_decay", 5e-4, 2e-3, log=True)
+        config.DROPOUT = trial.suggest_float("dropout", 0.30, 0.50)
+        config.BATCH_SIZE = trial.suggest_categorical("batch_size", [48, 64, 96])
+        label_smoothing = trial.suggest_float("label_smoothing", 0.0, 0.08)
+        grad_clip = trial.suggest_float("grad_clip", 0.8, 1.3)
+        config.ADVERSARIAL_LAMBDA_MAX = trial.suggest_float(
+            "adversarial_lambda_max", 0.15, 0.35
+        )
+        adversarial_weight = trial.suggest_float("adversarial_weight", 0.15, 0.35)
+        contrastive_weight = trial.suggest_float("contrastive_weight", 0.05, 0.25)
+        contrastive_temperature = trial.suggest_float(
+            "contrastive_temperature", 0.06, 0.09
+        )
+        gate_balance_weight = trial.suggest_float("gate_balance_weight", 0.0, 0.12)
     elif profile == "refine" and config.MODEL_NAME == "hybrid":
         config.LEARNING_RATE = trial.suggest_float("lr", 3.5e-4, 7.5e-4, log=True)
         config.WEIGHT_DECAY = trial.suggest_float("weight_decay", 2e-4, 8e-4, log=True)
@@ -191,13 +213,16 @@ def _sample_common_hparams(trial, config, profile="focused"):
         "adversarial_weight": adversarial_weight,
         "contrastive_weight": contrastive_weight,
         "contrastive_temperature": contrastive_temperature,
+        "gate_balance_weight": gate_balance_weight,
     }
 
 
 def _sample_hybrid_hparams(trial, config, profile="focused"):
 
-    choices = [96, 128] if profile == "best_recipe" else (
+    choices = [64, 96, 128] if profile == "cross_subject_v2" else (
+        [96, 128] if profile == "best_recipe" else (
         [128, 160] if profile == "refine" else [96, 128, 160]
+        )
     )
     config.EMBEDDING_DIM = trial.suggest_categorical("embedding_dim", choices)
 
@@ -333,6 +358,7 @@ class Objective:
                 adversarial_weight=extra["adversarial_weight"],
                 contrastive_loss_fn=contrastive_loss_fn,
                 contrastive_weight=extra["contrastive_weight"],
+                gate_balance_weight=extra["gate_balance_weight"],
                 heartbeat_every=0,
             )
             if self.args.model != "hybrid":
