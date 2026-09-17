@@ -12,7 +12,7 @@ class PhysioMLPEncoder(nn.Module):
     EDA activity, SCR peaks, heart rate, HRV κ.λπ.
 
     Feature Vector (EDA + PPG)
-        -> Linear -> BatchNorm -> ReLU -> Dropout
+        -> Linear -> LayerNorm -> ReLU -> Dropout
         -> Linear -> ReLU
         -> Physiological Embedding (batch, embedding_dim)
     """
@@ -29,7 +29,9 @@ class PhysioMLPEncoder(nn.Module):
         self.mlp = nn.Sequential(
 
             nn.Linear(input_dim, hidden_dim),
-            nn.BatchNorm1d(hidden_dim),
+            # LayerNorm avoids train-subject running statistics at
+            # evaluation time, which is important for unseen subjects.
+            nn.LayerNorm(hidden_dim),
             nn.ReLU(inplace=True),
             nn.Dropout(dropout),
 
