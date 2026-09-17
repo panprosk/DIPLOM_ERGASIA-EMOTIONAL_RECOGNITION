@@ -193,10 +193,10 @@ class CrossAttentionTransformer(nn.Module):
         physio_tokens = self.physio_pos_encoding(physio_tokens)
         physio_tokens = self.physio_self_attention(physio_tokens)
 
-        cross_attn_weight = None
+        raw_cross_attn = None
 
         for block in self.cross_attention_blocks:
-            eeg_tokens, physio_tokens, cross_attn_weight = block(eeg_tokens, physio_tokens)
+            eeg_tokens, physio_tokens, raw_cross_attn = block(eeg_tokens, physio_tokens)
 
         eeg_embedding = eeg_tokens.mean(dim=1)
         physio_embedding = physio_tokens.mean(dim=1)
@@ -220,8 +220,8 @@ class CrossAttentionTransformer(nn.Module):
         # αν είναι κοντά στο 1/num_keys -> σχεδόν ομοιόμορφη προσοχή,
         # αν είναι σαφώς μεγαλύτερο -> το μοντέλο "εστιάζει" επιλεκτικά.
         cross_attention_weight = (
-            cross_attn_weight.max(dim=2).values.mean(dim=1)
-            if cross_attn_weight is not None
+            raw_cross_attn.max(dim=2).values.mean(dim=1)
+            if raw_cross_attn is not None
             else torch.zeros(eeg.size(0), device=eeg.device)
         )
 
@@ -232,6 +232,11 @@ class CrossAttentionTransformer(nn.Module):
             "physio_embedding": physio_embedding,
             "contrastive_embedding": contrastive_embedding,
             "cross_attention_weight": cross_attention_weight,
+            # Raw (batch, n_eeg_patches, n_physio_patches) softmax matrix,
+            # εκτίθεται ώστε το training loop να μπορεί να υπολογίσει ένα
+            # attention-entropy regularization term (βλ. train_cross_attention_transformer.py)
+            # που ενθαρρύνει πιο "αιχμηρή" (λιγότερο ομοιόμορφη) cross-attention.
+            "cross_attn_matrix": raw_cross_attn,
         }
 
         if self.subject_classifier is not None:

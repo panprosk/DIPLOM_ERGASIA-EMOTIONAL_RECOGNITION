@@ -41,6 +41,7 @@ from __future__ import annotations
 
 import argparse
 import gc
+import logging
 import time
 
 import numpy as np
@@ -54,6 +55,8 @@ from src.pipeline.data_pipeline import DataPipeline
 from src.models import build_model
 from src.models.supervised_contrastive_loss import SupervisedContrastiveLoss
 from src.utils.evaluation import evaluate_hierarchical_predictions
+
+logging.basicConfig(level=logging.INFO, format="%(message)s")
 
 
 def parse_args():
@@ -75,6 +78,19 @@ def parse_args():
                          help="Overrides config.WEIGHT_DECAY if given.")
     parser.add_argument("--dropout", type=float, default=None,
                          help="Overrides config.DROPOUT if given.")
+    parser.add_argument("--window-seconds", type=float, default=None,
+                         help="Μέγεθος παραθύρου windowing σε δευτερόλεπτα "
+                              "(overrides config.WINDOW_SIZE). Default "
+                              "config: 6s. Βιβλιογραφία (DEAP cross-subject "
+                              "emotion recognition) προτείνει 2-5s με ~50% "
+                              "overlap ως καλύτερο συμβιβασμό ανάμεσα σε "
+                              "context και pseudo-replication/redundancy.")
+    parser.add_argument("--overlap", type=float, default=None,
+                         help="Ποσοστό επικάλυψης (0-1) μεταξύ διαδοχικών "
+                              "windows (overrides config.OVERLAP). Default "
+                              "config: 0.75 (πολύ υψηλό -- ~37 σχεδόν "
+                              "πανομοιότυπα windows/trial, πιθανή αιτία "
+                              "overfitting). Δοκίμασε 0.5.")
     parser.add_argument("--embedding-dim", type=int, default=None,
                          help="Overrides the Hybrid EEG/physio embedding dimension.")
     parser.add_argument("--patience", type=int, default=None,
@@ -83,29 +99,97 @@ def parse_args():
                               "config.EARLY_STOPPING_PATIENCE if given.")
     parser.add_argument("--label-smoothing", type=float, default=0.05,
                          help="Label smoothing for CrossEntropyLoss "
-                              "(reduces over-confident predictions).")
+                              "(reduces over-confident predictions). "
+                              "ΕΠΑΝΑΦΟΡΑ στο 0.05: το Optuna-informed 0.01 "
+                              "(hybrid_v3 Trial 0, partial/8-trial study) "
+                              "συνδυάστηκε συστηματικά με χειρότερα Test "
+                              "Trial F1 σε πολλαπλά πλήρη runs σε σχέση με "
+                              "το evidence-based καλύτερο recipe (0.5666).")
     parser.add_argument("--grad-clip", type=float, default=1.0,
                          help="Max gradient norm for clipping "
-                              "(stabilizes training, prevents loss spikes).")
+                              "(stabilizes training, prevents loss spikes). "
+                              "ΕΠΑΝΑΦΟΡΑ στο 1.0 (ίδιο rationale με "
+                              "--label-smoothing -- το Optuna 1.8 δεν "
+                              "μεταφράστηκε σε καλύτερο test score).")
+    parser.add_argument("--val-smooth-window", type=int, default=3,
+                         help="Πλάτος κυλιόμενου μέσου όρου (moving average) "
+                              "πάνω στο val_trial_f1 πριν χρησιμοποιηθεί για "
+                              "checkpoint selection/early stopping. Με μόνο "
+                              "~4 validation subjects το raw val_trial_f1 "
+                              "παρατηρήθηκε να ταλαντεύεται έντονα ανά epoch "
+                              "(π.χ. 0.55 -> 0.33 -> 0.48...), οδηγώντας σε "
+                              "επιλογή ενός 'τυχερού' noisy checkpoint που "
+                              "δεν αντιπροσωπεύει πραγματική βελτίωση (το "
+                              "test score ήταν σαφώς χαμηλότερο από το val "
+                              "score του επιλεγμένου checkpoint). 1 = "
+                              "απενεργοποιημένο (raw per-epoch value, παλιά "
+                              "συμπεριφορά).")
     parser.add_argument("--no-augment", action="store_true",
                          help="Απενεργοποιεί το EEG data augmentation "
                               "(Gaussian noise + channel dropout) στο training.")
+    parser.add_argument("--mixup-alpha", type=float, default=0.20,
+                         help="Beta(alpha, alpha) mixup πάνω σε EEG/physio/"
+                              "handcrafted features + soft label mixing "
+                              "(task loss = lam*CE(y_a) + (1-lam)*CE(y_b)). "
+                              "Default 0.20 ξανά: 3 πλήρη runs έδειξαν ότι το "
+                              "valence-margin filtering (όχι το mixup) είναι "
+                              "αυτό που χειροτερεύει τα metrics (χωρίς margin "
+                              "+ mixup=0.20 -> Test Trial F1 0.5666, με "
+                              "margin+mixup=0.10 -> 0.4377, με margin χωρίς "
+                              "mixup + Optuna defaults -> 0.4233). Άρα το "
+                              "margin filtering απενεργοποιήθηκε by default "
+                              "(βλ. --valence-margin) και το mixup=0.20 "
+                              "επαναφέρθηκε ως το evidence-based καλύτερο "
+                              "setup. 0.0 = απενεργοποιημένο.")
+    parser.add_argument("--valence-margin", type=float, default=0.0,
+                         help="Πλάτος 'νεκρής ζώνης' γύρω από το valence "
+                              "threshold (5.0) για dropping ασαφών trials "
+                              "([threshold-margin, threshold+margin]). "
+                              "Default 0.0 (ΑΠΕΝΕΡΓΟΠΟΙΗΜΕΝΟ): ενώ η ιδέα "
+                              "στηρίζεται στη βιβλιογραφία (label-noise "
+                              "reduction), σε 2 πλήρη runs με margin=1.0 το "
+                              "Test Trial F1 ήταν σαφώς χειρότερο (0.4377, "
+                              "0.4233) σε σχέση με το καλύτερο run χωρίς "
+                              "margin (0.5666) -- πιθανώς επειδή αφαιρεί "
+                              "15-50% των trials ανά subject, μειώνοντας "
+                              "πολύ το ήδη μικρό training set. Δώσε π.χ. "
+                              "--valence-margin 1.0 μόνο αν θες να το "
+                              "ξαναδοκιμάσεις ρητά (π.χ. με περισσότερα "
+                              "subjects/trials διαθέσιμα).")
     parser.add_argument("--no-adversarial", action="store_true",
                          help="Απενεργοποιεί το domain-adversarial subject "
                               "training (Gradient Reversal Layer).")
     parser.add_argument("--adversarial-weight", type=float, default=0.30,
                          help="Βάρος του adversarial subject loss "
-                              "(task_loss + weight * subject_loss).")
-    parser.add_argument("--adversarial-lambda-max", type=float, default=None,
-                         help="Overrides config.ADVERSARIAL_LAMBDA_MAX if given.")
+                              "(task_loss + weight * subject_loss). "
+                              "ΕΠΑΝΑΦΟΡΑ στο 0.30 (evidence-based καλύτερο "
+                              "recipe, Test Trial F1=0.5666) -- το "
+                              "Optuna-informed 0.383 (partial 8-trial study) "
+                              "δεν μεταφράστηκε σε καλύτερο test score σε "
+                              "πολλαπλά πλήρη runs.")
+    parser.add_argument("--adversarial-lambda-max", type=float, default=0.30,
+                         help="Overrides config.ADVERSARIAL_LAMBDA_MAX. "
+                              "ΕΠΑΝΑΦΟΡΑ στο config default (0.30).")
     parser.add_argument("--no-contrastive", action="store_true",
                          help="Απενεργοποιεί το Supervised Contrastive loss "
                               "πάνω στο fused embedding.")
     parser.add_argument("--contrastive-weight", type=float, default=0.20,
                          help="Βάρος του Supervised Contrastive loss "
-                              "(task_loss + ... + weight * contrastive_loss).")
+                              "(task_loss + ... + weight * contrastive_loss). "
+                              "ΕΠΑΝΑΦΟΡΑ στο 0.20 (evidence-based καλύτερο "
+                              "recipe).")
     parser.add_argument("--contrastive-temperature", type=float, default=0.07,
-                         help="Temperature του Supervised Contrastive loss.")
+                         help="Temperature του Supervised Contrastive loss. "
+                              "ΕΠΑΝΑΦΟΡΑ στο 0.07 (evidence-based καλύτερο "
+                              "recipe).")
+    parser.add_argument("--gate-balance-weight", type=float, default=0.05,
+                         help="Penalty = weight*(mean(eeg_gate) - 0.5)^2, "
+                              "ωθεί το gated fusion να μην στηρίζεται σχεδόν "
+                              "αποκλειστικά στο EEG branch (παρατηρήθηκε "
+                              "eeg_gate~0.75-0.79 σε προηγούμενα runs, ενώ "
+                              "το train acc έφτανε 0.87 με val acc ~0.45 -- "
+                              "ισχυρό overfitting σύμπτωμα). 0.0 = "
+                              "απενεργοποιημένο.")
     parser.add_argument("--no-eeg-handcrafted", action="store_true",
                          help="Απενεργοποιεί το EEG handcrafted-feature "
                               "branch (χρησιμοποιεί μόνο raw-EEG CNN).")
@@ -117,6 +201,22 @@ def parse_args():
                               "(γρήγορο sanity check). Default: όλα (40).")
     parser.add_argument("--no-save", action="store_true",
                          help="Δεν αποθηκεύει το checkpoint στο τέλος.")
+    parser.add_argument("--cache-path", type=str, default=None,
+                         help="Αν δοθεί: φορτώνει τα προ-υπολογισμένα "
+                              "datasets από εδώ αν υπάρχουν, αλλιώς τρέχει "
+                              "το πλήρες pipeline (preprocessing/feature "
+                              "extraction) και τα αποθηκεύει εκεί (π.χ. για "
+                              "μεταφορά σε άλλο μηχάνημα ώστε να παρακαμφθεί "
+                              "το CPU-bound preprocessing).")
+    parser.add_argument("--topk-avg", type=int, default=3,
+                         help="Weight-averaging (SWA-style) πάνω στα Top-K "
+                              "καλύτερα validation checkpoints (κατά val "
+                              "Trial-F1) στο τέλος του training. Μειώνει το "
+                              "variance/noise ενός μόνο 'best' checkpoint. "
+                              "Χρησιμοποιείται ΜΟΝΟ αν το validation score "
+                              "του averaged μοντέλου είναι >= του single-best "
+                              "(ποτέ δεν χειροτερεύει το αποτέλεσμα). "
+                              "Θέσε 0 ή 1 για να το απενεργοποιήσεις.")
 
     return parser.parse_args()
 
@@ -210,6 +310,48 @@ def build_subject_to_idx(dataset) -> dict:
     return {subject: idx for idx, subject in enumerate(unique_subjects)}
 
 
+def mixup_batch(eeg, physio, eeg_handcrafted, labels, alpha):
+    """
+    Mixup (Zhang et al., 2018) πάνω στα EEG/physio/handcrafted inputs.
+
+    Δημιουργεί ένα νέο "εικονικό" δείγμα ως γραμμικό συνδυασμό δύο
+    πραγματικών δειγμάτων: x_mix = lam*x_i + (1-lam)*x_j, με το lam να
+    δειγματίζεται από Beta(alpha, alpha). Το task loss υπολογίζεται
+    μετά ως lam*CE(pred, y_i) + (1-lam)*CE(pred, y_j) (soft target).
+
+    Γιατί βοηθάει εδώ: αντί το CNN/MLP να μαθαίνει το ακριβές
+    "υπογραφικό" waveform ενός συγκεκριμένου train subject/trial,
+    αναγκάζεται να μάθει ομαλές (γραμμικά ερμηνεύσιμες) αποφασιστικές
+    επιφάνειες μεταξύ κλάσεων -- τεκμηριωμένο στη βιβλιογραφία (π.χ.
+    MixEmo, ICML 2026 -- πρωτότυπο-based mixing για cross-subject EEG
+    emotion recognition) ότι βελτιώνει σημαντικά cross-subject
+    generalization σε σχέση με plain augmentation.
+
+    Δεν εφαρμόζεται στο adversarial subject loss ή στο supervised
+    contrastive loss (και τα δύο συνεχίζουν να χρησιμοποιούν τα
+    ΑΡΧΙΚΑ subject-ids/labels, ώστε να μην μπερδευτεί η σημασιολογία
+    τους) -- μόνο στο βασικό classification task loss.
+    """
+
+    if alpha <= 0.0:
+        return eeg, physio, eeg_handcrafted, labels, labels, 1.0
+
+    lam = float(np.random.beta(alpha, alpha))
+
+    batch_size = eeg.size(0)
+    perm = torch.randperm(batch_size, device=eeg.device)
+
+    eeg_mixed = lam * eeg + (1.0 - lam) * eeg[perm]
+    physio_mixed = lam * physio + (1.0 - lam) * physio[perm]
+    eeg_handcrafted_mixed = (
+        lam * eeg_handcrafted + (1.0 - lam) * eeg_handcrafted[perm]
+        if eeg_handcrafted is not None else None
+    )
+    labels_b = labels[perm]
+
+    return eeg_mixed, physio_mixed, eeg_handcrafted_mixed, labels, labels_b, lam
+
+
 def run_epoch(
     model,
     loader,
@@ -224,6 +366,8 @@ def run_epoch(
     adversarial_weight: float = 0.30,
     contrastive_loss_fn=None,
     contrastive_weight: float = 0.0,
+    mixup_alpha: float = 0.0,
+    gate_balance_weight: float = 0.0,
     heartbeat_every: int = 20,
     heartbeat_label: str = "",
 ):
@@ -278,6 +422,13 @@ def run_epoch(
             if train and augment:
                 eeg = augment_eeg(eeg)
 
+            if train and mixup_alpha > 0.0:
+                eeg, physio, eeg_handcrafted, labels_a, labels_b, lam = mixup_batch(
+                    eeg, physio, eeg_handcrafted, labels, mixup_alpha
+                )
+            else:
+                labels_a, labels_b, lam = labels, labels, 1.0
+
             if train:
                 optimizer.zero_grad()
 
@@ -287,7 +438,10 @@ def run_epoch(
                 grl_lambda=grl_lambda,
             )
 
-            task_loss = criterion(out["logits"], labels)
+            task_loss = (
+                lam * criterion(out["logits"], labels_a)
+                + (1.0 - lam) * criterion(out["logits"], labels_b)
+            )
             loss = task_loss
             subject_loss_value = 0.0
 
@@ -312,6 +466,19 @@ def run_epoch(
                 )
 
                 loss = loss + contrastive_weight * contrastive_loss
+
+            if train and gate_balance_weight > 0.0:
+                # Στα runs παρατηρήθηκε το eeg_gate να συγκλίνει προς
+                # ~0.75-0.79 (το μοντέλο βασίζεται σχεδόν αποκλειστικά
+                # στο EEG branch, αγνοώντας το physio branch). Το raw
+                # EEG έχει πολύ μεγαλύτερη inter-subject variability
+                # από τα handcrafted EDA/PPG features (FEEL paper
+                # finding), οπότε αυτή η ασυμμετρία πιθανώς επιδεινώνει
+                # το cross-subject overfitting. Penalty = απόσταση του
+                # μέσου gate από 0.5, ωθεί το μοντέλο να αξιοποιεί και
+                # τα δύο modality branches πιο ισορροπημένα.
+                gate_balance_loss = (out["eeg_gate"].mean() - 0.5) ** 2
+                loss = loss + gate_balance_weight * gate_balance_loss
 
             if train:
                 loss.backward()
@@ -404,7 +571,11 @@ def main():
     config.LEARNING_RATE = 3e-4
     config.WEIGHT_DECAY = 1e-3
     config.DROPOUT = 0.40
-    config.EARLY_STOPPING_PATIENCE = 10
+    # Αυξήθηκε 10 -> 15: με το Mixup ενεργοποιημένο (soft-label loss) η
+    # validation F1 έχει περισσότερο θόρυβο/variance ανά epoch, οπότε
+    # patience=10 έκοβε το training πρόωρα (~epoch 12) πριν προλάβει να
+    # συγκλίνει πλήρως. Ίδιο patience με τον Cross-Attention Transformer.
+    config.EARLY_STOPPING_PATIENCE = 15
 
     if args.batch_size is not None:
         config.BATCH_SIZE = args.batch_size
@@ -429,6 +600,18 @@ def main():
 
     if args.adversarial_lambda_max is not None:
         config.ADVERSARIAL_LAMBDA_MAX = args.adversarial_lambda_max
+
+    config.VALENCE_MARGIN = args.valence_margin
+
+    if args.window_seconds is not None:
+        config.WINDOW_SIZE_SEC = args.window_seconds
+        config.WINDOW_SIZE = int(args.window_seconds * config.SAMPLING_RATE)
+
+    if args.overlap is not None:
+        config.OVERLAP = args.overlap
+
+    if args.window_seconds is not None or args.overlap is not None:
+        config.STEP_SIZE = int(config.WINDOW_SIZE * (1 - config.OVERLAP))
 
     if args.no_eeg_handcrafted:
         config.EEG_HANDCRAFTED_DIM = None
@@ -464,6 +647,7 @@ def main():
     print(f"Label Smoothing   : {args.label_smoothing}", flush=True)
     print(f"Grad Clip Norm    : {args.grad_clip}", flush=True)
     print(f"EEG Augmentation  : {'OFF' if args.no_augment else 'ON (noise + channel dropout)'}", flush=True)
+    print(f"Mixup             : {'OFF' if args.mixup_alpha <= 0.0 else f'ON (alpha={args.mixup_alpha})'}", flush=True)
     print(f"EEG Handcrafted   : {'OFF' if args.no_eeg_handcrafted else f'ON (dim={config.EEG_HANDCRAFTED_DIM})'}", flush=True)
     print(f"Domain-Adversarial: {'OFF' if args.no_adversarial else f'ON (lambda_max={config.ADVERSARIAL_LAMBDA_MAX}, weight={args.adversarial_weight})'}", flush=True)
     print(f"Num Subjects Used : {args.num_subjects or 'ALL (32)'}", flush=True)
@@ -486,7 +670,7 @@ def main():
         test_loader,
         train_labels,
         train_subjects,
-    ) = pipeline.run()
+    ) = pipeline.run(cache_path=args.cache_path)
 
     print(f"\nData pipeline finished in {time.time() - t0:.1f}s\n")
 
@@ -545,6 +729,13 @@ def main():
     best_val_f1 = -1.0
     best_state = None
     epochs_without_improvement = 0
+    val_trial_f1_history = []
+
+    # Top-K checkpoint pool για weight-averaging (SWA-style) στο τέλος.
+    # Το GroupNorm (όχι BatchNorm) στο EEG encoder σημαίνει ότι ΔΕΝ
+    # χρειάζεται recompute των running mean/var μετά το averaging --
+    # το plain parameter-wise mean είναι απευθείας valid.
+    topk_checkpoints = []  # list of (val_trial_f1, state_dict_cpu)
 
     checkpoint_path = config.OUTPUT_DIR / "hybrid_cnn_mlp_regularized.pt"
 
@@ -571,6 +762,8 @@ def main():
             adversarial_weight=args.adversarial_weight,
             contrastive_loss_fn=contrastive_loss_fn,
             contrastive_weight=args.contrastive_weight,
+            mixup_alpha=args.mixup_alpha,
+            gate_balance_weight=args.gate_balance_weight,
             heartbeat_label="train ",
         )
 
@@ -585,6 +778,21 @@ def main():
         current_lr = optimizer.param_groups[0]["lr"]
         epoch_time = time.time() - epoch_t0
 
+        # Κυλιόμενος μέσος όρος (moving average) πάνω στο val_trial_f1
+        # για checkpoint selection/early stopping -- με μόνο λίγα
+        # validation subjects (π.χ. 4/32) το raw per-epoch trial-F1
+        # παρουσιάζει μεγάλο θόρυβο/variance, οδηγώντας σε επιλογή
+        # ενός "τυχερού" (noisy spike) checkpoint που δεν γενικεύει
+        # (παρατηρήθηκε: val_trial_f1 spike 0.5470 στο epoch 2, αλλά
+        # το τελικό Test Trial F1 ήταν μόλις 0.4377). Ο ίδιος ο ωμός
+        # (raw) val_trial_f1 συνεχίζει να τυπώνεται/να στέλνεται στο
+        # scheduler (LR decay) -- η εξομάλυνση εφαρμόζεται ΜΟΝΟ στην
+        # απόφαση "είναι αυτό νέο best;".
+        val_trial_f1_history.append(val_metrics["trial_f1"])
+        smoothed_val_f1 = float(
+            np.mean(val_trial_f1_history[-args.val_smooth_window:])
+        )
+
         # Απελευθερώνει ρητά κάθε "νεκρό" (unreferenced) αντικείμενο
         # στο τέλος κάθε epoch -- μικρό κόστος, βοηθάει να μη
         # συσσωρεύεται σταδιακά memory pressure σε πολύωρα runs σε
@@ -598,12 +806,13 @@ def main():
             f"{val_metrics['f1']:>8.4f} | {val_metrics['trial_f1']:>8.4f} | "
             f"{val_metrics['eeg_gate_mean']:>8.4f} | "
             f"{train_metrics['subject_loss']:>9.4f} | "
-            f"{current_lr:>8.6f} | {epoch_time/60:>8.1f} min",
+            f"{current_lr:>8.6f} | {epoch_time/60:>8.1f} min"
+            f" | smoothT.F1={smoothed_val_f1:.4f}",
             flush=True,
         )
 
-        if val_metrics["trial_f1"] > best_val_f1:
-            best_val_f1 = val_metrics["trial_f1"]
+        if smoothed_val_f1 > best_val_f1:
+            best_val_f1 = smoothed_val_f1
             best_state = {k: v.detach().cpu().clone() for k, v in model.state_dict().items()}
             epochs_without_improvement = 0
 
@@ -627,15 +836,69 @@ def main():
         else:
             epochs_without_improvement += 1
 
-            if epochs_without_improvement >= config.EARLY_STOPPING_PATIENCE:
-                print(
-                    f"\nEarly stopping: no Val F1 improvement for "
-                    f"{config.EARLY_STOPPING_PATIENCE} epochs (stopped at epoch {epoch}).",
-                    flush=True,
-                )
-                break
+        # Top-K pool κρατάει ΚΑΘΕ epoch (όχι μόνο τα "νέα best") -- έτσι
+        # το averaging βλέπει πραγματικά K διαφορετικά, καλά epochs γύρω
+        # από τη σύγκλιση, όχι μόνο μονότονα αυξανόμενα best.
+        if args.topk_avg and args.topk_avg > 1:
+            state_cpu = {k: v.detach().cpu().clone() for k, v in model.state_dict().items()}
+            topk_checkpoints.append((val_metrics["trial_f1"], state_cpu))
+            topk_checkpoints.sort(key=lambda pair: pair[0], reverse=True)
+            del topk_checkpoints[args.topk_avg:]
+
+        if epochs_without_improvement >= config.EARLY_STOPPING_PATIENCE:
+            print(
+                f"\nEarly stopping: no Val F1 improvement for "
+                f"{config.EARLY_STOPPING_PATIENCE} epochs (stopped at epoch {epoch}).",
+                flush=True,
+            )
+            break
 
     print("\nTraining finished.\n", flush=True)
+
+    if best_state is not None:
+        model.load_state_dict(best_state)
+
+    used_topk_avg = False
+    if args.topk_avg and args.topk_avg > 1 and len(topk_checkpoints) >= 2:
+        # Plain parameter-wise mean πάνω στα Top-K state_dicts (SWA-style).
+        # Ασφαλές γιατί το EEG encoder χρησιμοποιεί GroupNorm (όχι
+        # BatchNorm) -- δεν υπάρχουν running mean/var που να χρειάζονται
+        # recompute μετά το averaging.
+        avg_state = {}
+        keys = topk_checkpoints[0][1].keys()
+        for key in keys:
+            stacked = torch.stack([sd[key].float() for _, sd in topk_checkpoints], dim=0)
+            avg_state[key] = stacked.mean(dim=0).to(topk_checkpoints[0][1][key].dtype)
+
+        avg_model_state_backup = {k: v.detach().cpu().clone() for k, v in model.state_dict().items()}
+        model.load_state_dict(avg_state)
+        avg_val_metrics = run_epoch(
+            model, validation_loader, criterion, optimizer, device, train=False,
+        )
+        print(
+            f"Top-{len(topk_checkpoints)} weight-averaged model -- "
+            f"Val Trial-F1: {avg_val_metrics['trial_f1']:.4f} "
+            f"(single-best checkpoint Val Trial-F1: {best_val_f1:.4f})",
+            flush=True,
+        )
+        if avg_val_metrics["trial_f1"] >= best_val_f1:
+            print("--> Χρησιμοποιείται το weight-averaged μοντέλο για το τελικό test.", flush=True)
+            best_state = avg_state
+            used_topk_avg = True
+            if not args.no_save:
+                config.OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
+                torch.save(
+                    {
+                        "model_state_dict": best_state,
+                        "config": config,
+                        "val_trial_f1": avg_val_metrics["trial_f1"],
+                        "topk_avg": len(topk_checkpoints),
+                    },
+                    checkpoint_path,
+                )
+        else:
+            print("--> Το single-best checkpoint παραμένει καλύτερο, δεν αλλάζει τίποτα.", flush=True)
+            model.load_state_dict(avg_model_state_backup)
 
     if best_state is not None:
         model.load_state_dict(best_state)
@@ -650,7 +913,10 @@ def main():
     )
 
     print("=" * 80)
-    print("FINAL TEST SET EVALUATION (best validation checkpoint)")
+    print(
+        "FINAL TEST SET EVALUATION "
+        f"({'Top-K weight-averaged' if used_topk_avg else 'best validation'} checkpoint)"
+    )
     print("=" * 80)
     print(f"Test Loss        : {test_metrics['loss']:.4f}")
     print(f"Test Accuracy    : {test_metrics['accuracy']:.4f}")

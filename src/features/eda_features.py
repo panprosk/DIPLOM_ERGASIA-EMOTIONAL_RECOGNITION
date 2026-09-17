@@ -22,21 +22,25 @@ class EDAFeatureExtractor:
 
     def extract(self, eda_window):
 
-        signal = eda_window.squeeze()
+        signal = np.asarray(eda_window, dtype=np.float64).reshape(-1)
 
-        cleaned = nk.eda_clean(
-            signal,
-            sampling_rate=self.fs
-        )
-
-        phasic = nk.eda_phasic(
-            cleaned,
-            sampling_rate=self.fs
-        )
-
-        tonic = phasic["EDA_Tonic"].values
-
-        phasic_signal = phasic["EDA_Phasic"].values
+        try:
+            cleaned = np.asarray(
+                nk.eda_clean(signal, sampling_rate=self.fs),
+                dtype=np.float64,
+            ).reshape(-1)
+            phasic = nk.eda_phasic(cleaned, sampling_rate=self.fs)
+            tonic = np.asarray(phasic["EDA_Tonic"].values, dtype=np.float64)
+            phasic_signal = np.asarray(
+                phasic["EDA_Phasic"].values, dtype=np.float64
+            )
+        except (TypeError, ValueError, IndexError):
+            # NeuroKit2/SciPy versions differ in their short-window filter
+            # handling. Keep the feature dimensionality stable if filtering
+            # fails on a degenerate window.
+            cleaned = signal
+            tonic = signal
+            phasic_signal = np.diff(signal, prepend=signal[0])
 
         # --- Safe Peak Detection ---
         try:
@@ -86,7 +90,9 @@ class EDAFeatureExtractor:
 
         ]
 
-        return np.asarray(
-            features,
-            dtype=np.float32
+        return np.nan_to_num(
+            np.asarray(features, dtype=np.float32),
+            nan=0.0,
+            posinf=0.0,
+            neginf=0.0,
         )

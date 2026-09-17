@@ -10,3 +10,5 @@ seaborn>=3.0.0
 pyyaml>=6.0
 tqdm>=4.65.0
 pickle5>=0.0.11
+optuna>=4.0.0
+plotly>=5.20.0

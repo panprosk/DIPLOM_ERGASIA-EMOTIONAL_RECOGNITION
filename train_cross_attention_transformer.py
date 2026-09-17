@@ -28,6 +28,7 @@ from __future__ import annotations
 
 import argparse
 import gc
+import logging
 import time
 
 import numpy as np
@@ -41,6 +42,8 @@ from src.pipeline.data_pipeline import DataPipeline
 from src.models import build_model
 from src.models.supervised_contrastive_loss import SupervisedContrastiveLoss
 from src.utils.evaluation import evaluate_hierarchical_predictions
+
+logging.basicConfig(level=logging.INFO, format="%(message)s")
 
 
 def parse_args():
@@ -60,6 +63,18 @@ def parse_args():
                          help="Overrides config.WEIGHT_DECAY if given.")
     parser.add_argument("--dropout", type=float, default=None,
                          help="Overrides config.DROPOUT if given.")
+    parser.add_argument("--window-seconds", type=float, default=None,
+                         help="Μέγεθος παραθύρου windowing σε δευτερόλεπτα "
+                              "(overrides config.WINDOW_SIZE). Πρέπει να "
+                              "διαιρείται ακριβώς από το --patch-size "
+                              "(σε samples) για να δουλέψει το patch "
+                              "embedding του Transformer.")
+    parser.add_argument("--overlap", type=float, default=None,
+                         help="Ποσοστό επικάλυψης (0-1) μεταξύ διαδοχικών "
+                              "windows (overrides config.OVERLAP). Default "
+                              "config: 0.75 (πολύ υψηλό -- πιθανή αιτία "
+                              "overfitting λόγω pseudo-replication). "
+                              "Δοκίμασε 0.5.")
     parser.add_argument("--patience", type=int, default=None,
                          help="Early stopping patience (epochs without "
                               "Val F1 improvement). Overrides "
@@ -85,6 +100,28 @@ def parse_args():
                          help="Βάρος του Supervised Contrastive loss.")
     parser.add_argument("--contrastive-temperature", type=float, default=0.07,
                          help="Temperature του Supervised Contrastive loss.")
+    parser.add_argument("--attn-entropy-weight", type=float, default=0.05,
+                         help="Βάρος target-entropy regularizer πάνω στην "
+                              "cross-attention (EEG->Physio): penalty = "
+                              "weight*(entropy - 0.5*max_entropy)^2. Σπρώχνει "
+                              "την κατανομή σε ΜΕΤΡΙΑ (όχι πλήρως uniform "
+                              "ούτε πλήρως one-hot) αιχμηρότητα. 0.0 = "
+                              "απενεργοποιημένο.")
+    parser.add_argument("--val-smooth-window", type=int, default=3,
+                         help="Πλάτος κυλιόμενου μέσου όρου πάνω στο "
+                              "val_trial_f1 πριν χρησιμοποιηθεί για "
+                              "checkpoint selection/early stopping (ίδιο "
+                              "rationale με το Hybrid CNN-MLP -- μικρό "
+                              "validation set -> θορυβώδες raw trial-F1 ανά "
+                              "epoch). 1 = απενεργοποιημένο.")
+    parser.add_argument("--valence-margin", type=float, default=0.0,
+                         help="Πλάτος 'νεκρής ζώνης' γύρω από το valence "
+                              "threshold (5.0) για dropping ασαφών trials. "
+                              "Default 0.0 (ΑΠΕΝΕΡΓΟΠΟΙΗΜΕΝΟ) -- σε πλήρη "
+                              "runs στο Hybrid CNN-MLP το margin filtering "
+                              "χειροτέρεψε σαφώς το Test Trial F1 (βλ. "
+                              "train_hybrid_baseline.py). Ίδιο evidence-based "
+                              "default εδώ.")
     parser.add_argument("--d-model", type=int, default=None,
                          help="Overrides config.TRANSFORMER_D_MODEL if given.")
     parser.add_argument("--num-heads", type=int, default=None,
@@ -95,6 +132,8 @@ def parse_args():
                          help="Overrides config.TRANSFORMER_CROSS_ATTN_LAYERS if given.")
     parser.add_argument("--patch-size", type=int, default=None,
                          help="Overrides config.TRANSFORMER_PATCH_SIZE if given.")
+    parser.add_argument("--dim-feedforward", type=int, default=None,
+                         help="Overrides config.TRANSFORMER_FF_DIM if given.")
     parser.add_argument("--num-subjects", type=int, default=None,
                          help="Χρησιμοποιεί μόνο τα πρώτα N subjects "
                               "(γρήγορο sanity check). Default: όλα.")
@@ -103,6 +142,21 @@ def parse_args():
                               "(γρήγορο sanity check). Default: όλα (40).")
     parser.add_argument("--no-save", action="store_true",
                          help="Δεν αποθηκεύει το checkpoint στο τέλος.")
+    parser.add_argument("--cache-path", type=str, default=None,
+                         help="Αν δοθεί: φορτώνει τα προ-υπολογισμένα "
+                              "datasets από εδώ αν υπάρχουν, αλλιώς τρέχει "
+                              "το πλήρες pipeline (preprocessing/feature "
+                              "extraction) και τα αποθηκεύει εκεί (π.χ. για "
+                              "μεταφορά σε άλλο μηχάνημα ώστε να παρακαμφθεί "
+                              "το CPU-bound preprocessing).")
+    parser.add_argument("--topk-avg", type=int, default=3,
+                         help="Weight-averaging (SWA-style) πάνω στα Top-K "
+                              "καλύτερα validation checkpoints (κατά val "
+                              "Trial-F1) στο τέλος του training. Χρησιμο-"
+                              "ποιείται ΜΟΝΟ αν το validation score του "
+                              "averaged μοντέλου είναι >= του single-best "
+                              "(ποτέ δεν χειροτερεύει το αποτέλεσμα). "
+                              "Θέσε 0 ή 1 για να το απενεργοποιήσεις.")
 
     return parser.parse_args()
 
@@ -191,6 +245,7 @@ def run_epoch(
     adversarial_weight: float = 0.30,
     contrastive_loss_fn=None,
     contrastive_weight: float = 0.0,
+    attn_entropy_weight: float = 0.0,
     heartbeat_every: int = 20,
     heartbeat_label: str = "",
 ):
@@ -263,6 +318,28 @@ def run_epoch(
                 )
 
                 loss = loss + contrastive_weight * contrastive_loss
+
+            if train and attn_entropy_weight > 0.0 and "cross_attn_matrix" in out:
+
+                # ΣΗΜΕΙΩΣΗ (v2 -- διόρθωση overshoot): η πρώτη εκδοχή
+                # αυτού του regularizer ελαχιστοποιούσε απευθείας την
+                # entropy (loss += weight * entropy), κάτι που έσπρωξε
+                # την cross-attention από πλήρως ΟΜΟΙΟΜΟΡΦΗ (max=0.0417
+                # == 1/24) σε πλήρως ΣΥΓΚΕΝΤΡΩΜΕΝΗ/one-hot (max=0.9949)
+                # -- και τα δύο άκρα είναι εξίσου άχρηστα (καμία πραγματική
+                # βελτίωση στο Test Trial F1: 0.5576 -> 0.5503). Αντ' αυτού
+                # στοχεύουμε σε ΜΕΤΡΙΑ (moderate) εντροπία: penalty =
+                # weight * (entropy - target_entropy)^2, όπου target_entropy
+                # = 50% της μέγιστης δυνατής εντροπίας (πλήρως ομοιόμορφη
+                # πάνω σε num_keys). Το τετραγωνικό penalty τραβάει την
+                # κατανομή προς ένα ενδιάμεσο σημείο (ούτε πλήρως uniform,
+                # ούτε πλήρως one-hot) αντί να την οδηγεί συνεχώς προς ένα
+                # άκρο μέχρι το τέλος του training.
+                attn = out["cross_attn_matrix"]
+                entropy = -(attn * torch.log(attn + 1e-8)).sum(dim=-1).mean()
+                num_keys = attn.size(-1)
+                target_entropy = 0.5 * torch.log(torch.tensor(float(num_keys), device=attn.device))
+                loss = loss + attn_entropy_weight * (entropy - target_entropy) ** 2
 
             if train:
                 loss.backward()
@@ -359,6 +436,13 @@ def main():
         config.WEIGHT_DECAY = args.weight_decay
 
     if args.dropout is not None:
+        # ΔΙΟΡΘΩΣΗ ΣΗΜΑΝΤΙΚΟΥ BUG: το μοντέλο (μέσω model_factory.py)
+        # χρησιμοποιεί config.TRANSFORMER_DROPOUT, ΟΧΙ config.DROPOUT.
+        # Πριν, το --dropout άλλαζε το config.DROPOUT το οποίο ΔΕΝ
+        # διαβάζεται πουθενά από το CrossAttentionTransformer -- η
+        # παράμετρος ήταν ουσιαστικά "νεκρή" (δεν είχε καμία επίδραση
+        # στο πραγματικό dropout του μοντέλου).
+        config.TRANSFORMER_DROPOUT = args.dropout
         config.DROPOUT = args.dropout
 
     if args.patience is not None:
@@ -366,6 +450,8 @@ def main():
 
     if args.adversarial_lambda_max is not None:
         config.ADVERSARIAL_LAMBDA_MAX = args.adversarial_lambda_max
+
+    config.VALENCE_MARGIN = args.valence_margin
 
     if args.d_model is not None:
         config.TRANSFORMER_D_MODEL = args.d_model
@@ -381,6 +467,28 @@ def main():
 
     if args.patch_size is not None:
         config.TRANSFORMER_PATCH_SIZE = args.patch_size
+
+    if args.dim_feedforward is not None:
+        config.TRANSFORMER_FF_DIM = args.dim_feedforward
+
+    if args.window_seconds is not None:
+        config.WINDOW_SIZE_SEC = args.window_seconds
+        config.WINDOW_SIZE = int(args.window_seconds * config.SAMPLING_RATE)
+
+    if args.overlap is not None:
+        config.OVERLAP = args.overlap
+
+    if args.window_seconds is not None or args.overlap is not None:
+        config.STEP_SIZE = int(config.WINDOW_SIZE * (1 - config.OVERLAP))
+
+    if config.WINDOW_SIZE % config.TRANSFORMER_PATCH_SIZE != 0:
+        raise ValueError(
+            f"config.WINDOW_SIZE ({config.WINDOW_SIZE} samples) πρέπει να "
+            f"διαιρείται ακριβώς από το --patch-size "
+            f"({config.TRANSFORMER_PATCH_SIZE}) για το patch embedding του "
+            f"Transformer. Διάλεξε --window-seconds ώστε "
+            f"window_seconds*{config.SAMPLING_RATE} % patch_size == 0."
+        )
 
     torch.manual_seed(config.SEED)
     np.random.seed(config.SEED)
@@ -402,7 +510,7 @@ def main():
     print(f"Pin Memory        : {config.PIN_MEMORY}", flush=True)
     print(f"Learning Rate     : {config.LEARNING_RATE}", flush=True)
     print(f"Weight Decay      : {config.WEIGHT_DECAY}", flush=True)
-    print(f"Dropout           : {config.DROPOUT}", flush=True)
+    print(f"Dropout           : {config.TRANSFORMER_DROPOUT}", flush=True)
     print(f"Early Stop Patience: {config.EARLY_STOPPING_PATIENCE}", flush=True)
     print(f"Label Smoothing   : {args.label_smoothing}", flush=True)
     print(f"Grad Clip Norm    : {args.grad_clip}", flush=True)
@@ -413,6 +521,7 @@ def main():
     print(f"Self-Attn Layers  : {config.TRANSFORMER_SELF_ATTN_LAYERS}", flush=True)
     print(f"Cross-Attn Layers : {config.TRANSFORMER_CROSS_ATTN_LAYERS}", flush=True)
     print(f"Patch Size        : {config.TRANSFORMER_PATCH_SIZE}", flush=True)
+    print(f"FF Dim            : {config.TRANSFORMER_FF_DIM}", flush=True)
     print(f"Num Subjects Used : {args.num_subjects or 'ALL (32)'}", flush=True)
     print(f"Trials/Subject    : {args.trials_per_subject or 'ALL (40)'}", flush=True)
     print("=" * 80, flush=True)
@@ -433,7 +542,7 @@ def main():
         test_loader,
         train_labels,
         train_subjects,
-    ) = pipeline.run()
+    ) = pipeline.run(cache_path=args.cache_path)
 
     print(f"\nData pipeline finished in {time.time() - t0:.1f}s\n", flush=True)
 
@@ -472,6 +581,12 @@ def main():
     else:
         print("Supervised Contrastive: OFF\n", flush=True)
 
+    print(
+        f"Cross-Attn Entropy Reg: "
+        f"{'ON (weight=' + str(args.attn_entropy_weight) + ')' if args.attn_entropy_weight > 0 else 'OFF'}\n",
+        flush=True,
+    )
+
     # mode="max" πάνω στο ίδιο trial_f1 που χρησιμοποιείται και για
     # checkpoint selection (ίδιο fix με το Model 1 -- πριν παρακολουθούσε
     # το val loss ενώ το checkpoint επιλεγόταν με βάση το trial_f1, κάτι
@@ -491,6 +606,13 @@ def main():
     best_val_f1 = -1.0
     best_state = None
     epochs_without_improvement = 0
+    val_trial_f1_history = []
+
+    # Top-K checkpoint pool για weight-averaging (SWA-style) στο τέλος.
+    # Ο Transformer χρησιμοποιεί LayerNorm (όχι BatchNorm) -- δεν
+    # υπάρχουν running mean/var, άρα το plain parameter-wise mean είναι
+    # απευθείας valid, χωρίς recompute.
+    topk_checkpoints = []  # list of (val_trial_f1, state_dict_cpu)
 
     checkpoint_path = config.OUTPUT_DIR / "cross_attention_transformer_baseline.pt"
 
@@ -510,6 +632,7 @@ def main():
             adversarial_weight=args.adversarial_weight,
             contrastive_loss_fn=contrastive_loss_fn,
             contrastive_weight=args.contrastive_weight,
+            attn_entropy_weight=args.attn_entropy_weight,
             heartbeat_label="train ",
         )
 
@@ -524,6 +647,14 @@ def main():
         current_lr = optimizer.param_groups[0]["lr"]
         epoch_time = time.time() - epoch_t0
 
+        # Ίδιο rationale με το Hybrid CNN-MLP: rolling average πάνω στο
+        # val_trial_f1 για checkpoint selection, ώστε να μην επιλέγεται
+        # ένα τυχαίο noisy-spike epoch λόγω μικρού validation set.
+        val_trial_f1_history.append(val_metrics["trial_f1"])
+        smoothed_val_f1 = float(
+            np.mean(val_trial_f1_history[-args.val_smooth_window:])
+        )
+
         gc.collect()
 
         print(
@@ -533,12 +664,13 @@ def main():
             f"{val_metrics['f1']:>8.4f} | {val_metrics['trial_f1']:>8.4f} | "
             f"{val_metrics['cross_attn_mean']:>9.4f} | "
             f"{train_metrics['subject_loss']:>9.4f} | "
-            f"{current_lr:>8.6f} | {epoch_time/60:>8.1f} min",
+            f"{current_lr:>8.6f} | {epoch_time/60:>8.1f} min"
+            f" | smoothT.F1={smoothed_val_f1:.4f}",
             flush=True,
         )
 
-        if val_metrics["trial_f1"] > best_val_f1:
-            best_val_f1 = val_metrics["trial_f1"]
+        if smoothed_val_f1 > best_val_f1:
+            best_val_f1 = smoothed_val_f1
             best_state = {k: v.detach().cpu().clone() for k, v in model.state_dict().items()}
             epochs_without_improvement = 0
 
@@ -558,15 +690,65 @@ def main():
         else:
             epochs_without_improvement += 1
 
-            if epochs_without_improvement >= config.EARLY_STOPPING_PATIENCE:
-                print(
-                    f"\nEarly stopping: no Val F1 improvement for "
-                    f"{config.EARLY_STOPPING_PATIENCE} epochs (stopped at epoch {epoch}).",
-                    flush=True,
-                )
-                break
+        # Top-K pool κρατάει ΚΑΘΕ epoch (όχι μόνο τα "νέα best") -- έτσι
+        # το averaging βλέπει πραγματικά K διαφορετικά, καλά epochs γύρω
+        # από τη σύγκλιση, όχι μόνο μονότονα αυξανόμενα best.
+        if args.topk_avg and args.topk_avg > 1:
+            state_cpu = {k: v.detach().cpu().clone() for k, v in model.state_dict().items()}
+            topk_checkpoints.append((val_metrics["trial_f1"], state_cpu))
+            topk_checkpoints.sort(key=lambda pair: pair[0], reverse=True)
+            del topk_checkpoints[args.topk_avg:]
+
+        if epochs_without_improvement >= config.EARLY_STOPPING_PATIENCE:
+            print(
+                f"\nEarly stopping: no Val F1 improvement for "
+                f"{config.EARLY_STOPPING_PATIENCE} epochs (stopped at epoch {epoch}).",
+                flush=True,
+            )
+            break
 
     print("\nTraining finished.\n", flush=True)
+
+    if best_state is not None:
+        model.load_state_dict(best_state)
+
+    used_topk_avg = False
+    if args.topk_avg and args.topk_avg > 1 and len(topk_checkpoints) >= 2:
+        avg_state = {}
+        keys = topk_checkpoints[0][1].keys()
+        for key in keys:
+            stacked = torch.stack([sd[key].float() for _, sd in topk_checkpoints], dim=0)
+            avg_state[key] = stacked.mean(dim=0).to(topk_checkpoints[0][1][key].dtype)
+
+        avg_model_state_backup = {k: v.detach().cpu().clone() for k, v in model.state_dict().items()}
+        model.load_state_dict(avg_state)
+        avg_val_metrics = run_epoch(
+            model, validation_loader, criterion, optimizer, device, train=False,
+        )
+        print(
+            f"Top-{len(topk_checkpoints)} weight-averaged model -- "
+            f"Val Trial-F1: {avg_val_metrics['trial_f1']:.4f} "
+            f"(single-best checkpoint Val Trial-F1: {best_val_f1:.4f})",
+            flush=True,
+        )
+        if avg_val_metrics["trial_f1"] >= best_val_f1:
+            print("--> Χρησιμοποιείται το weight-averaged μοντέλο για το τελικό test.", flush=True)
+            best_state = avg_state
+            used_topk_avg = True
+            if not args.no_save:
+                config.OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
+                torch.save(
+                    {
+                        "model_state_dict": best_state,
+                        "config": config,
+                        "val_trial_f1": avg_val_metrics["trial_f1"],
+                        "topk_avg": len(topk_checkpoints),
+                    },
+                    checkpoint_path,
+                )
+        else:
+            print("--> Το single-best checkpoint παραμένει καλύτερο, δεν αλλάζει τίποτα.", flush=True)
+            model.load_state_dict(avg_model_state_backup)
 
     if best_state is not None:
         model.load_state_dict(best_state)
@@ -581,7 +763,10 @@ def main():
     )
 
     print("=" * 80)
-    print("FINAL TEST SET EVALUATION (best validation checkpoint)")
+    print(
+        "FINAL TEST SET EVALUATION "
+        f"({'Top-K weight-averaged' if used_topk_avg else 'best validation'} checkpoint)"
+    )
     print("=" * 80)
     print(f"Test Loss        : {test_metrics['loss']:.4f}")
     print(f"Test Accuracy    : {test_metrics['accuracy']:.4f}")

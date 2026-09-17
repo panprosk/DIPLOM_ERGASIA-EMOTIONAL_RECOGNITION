@@ -1,6 +1,7 @@
 from __future__ import annotations
 import gc
 import logging
+import pickle
 from pathlib import Path
 from typing import Dict, List
 import numpy as np
@@ -177,10 +178,43 @@ class DataPipeline:
         dataset).
         """
 
+        # ΣΗΜΑΝΤΙΚΟ (memory): np.stack([...]).astype(float16), ακόμη
+        # και np.stack([...astype(float16)...]), χτίζει ΠΡΩΤΑ μια
+        # Python list με ΟΛΑ τα per-window arrays (ίδιο μέγεθος με το
+        # τελικό stacked array) ΚΑΙ ταυτόχρονα κρατάει ζωντανά τα
+        # αρχικά float32 per-window arrays μέσα στα window dicts, πριν
+        # καν ξεκινήσει το np.stack -- δηλαδή peak μνήμη έως και ~4x
+        # το τελικό μέγεθος (π.χ. για EEG (32560,32,768): float32
+        # originals 2.98 GiB + float16 list 1.49 GiB + τελικό stacked
+        # 1.49 GiB ταυτόχρονα -> MemoryError σε μηχάνημα με 8GB RAM).
+        #
+        # Λύση: preallocate το τελικό float16 array και γράφουμε ένα-
+        # ένα window μέσα του, ΑΔΕΙΑΖΟΝΤΑΣ (w[key] = None) το αρχικό
+        # float32 reference αμέσως μετά -- έτσι ο Python garbage
+        # collector μπορεί να ελευθερώσει σταδιακά τα αρχικά arrays
+        # καθώς προχωράμε, αντί να τα κρατάει όλα ζωντανά ταυτόχρονα.
+        # Peak μνήμη πέφτει σε ~1x το τελικό μέγεθος (+ ένα window τη
+        # φορά), δηλαδή ~3-4x λιγότερη μνήμη από πριν.
+        def _stack_raw_signal(key: str) -> np.ndarray:
+
+            first_shape = windows[0][key].shape
+
+            out = np.empty((len(windows),) + first_shape, dtype=np.float16)
+
+            for i, w in enumerate(windows):
+                out[i] = w[key]
+                w[key] = None  # ελευθερώνει το float32 original νωρίς
+
+            return out
+
+        eeg_arr = _stack_raw_signal("eeg")
+        eda_arr = _stack_raw_signal("eda")
+        ppg_arr = _stack_raw_signal("ppg")
+
         return {
-            "eeg": np.stack([w["eeg"] for w in windows]).astype(np.float16),
-            "eda": np.stack([w["eda"] for w in windows]).astype(np.float16),
-            "ppg": np.stack([w["ppg"] for w in windows]).astype(np.float16),
+            "eeg": eeg_arr,
+            "eda": eda_arr,
+            "ppg": ppg_arr,
             "features": np.stack([w["features"] for w in windows]),
             "physio_features": np.stack([w["physio_features"] for w in windows]),
             "labels": np.asarray([w["label"] for w in windows], dtype=np.int64),
@@ -189,7 +223,18 @@ class DataPipeline:
             "windows": np.asarray([w["window_id"] for w in windows], dtype=np.int64),
         }
 
-    def run(self):
+    def run(self, cache_path: str | None = None):
+
+        if cache_path is not None and Path(cache_path).exists():
+            logger.info("")
+            logger.info("======================================")
+            logger.info(f"Loading cached pipeline datasets <- {cache_path}")
+            logger.info("======================================")
+
+            with open(cache_path, "rb") as f:
+                cached = pickle.load(f)
+
+            return self._build_loaders_and_return(**cached)
 
         logger.info("")
         logger.info("======================================")
@@ -267,13 +312,48 @@ class DataPipeline:
                         eda_data = data.get("eda")
                         ppg_data = data.get("ppg")
 
+                    trial_labels = data.get("labels")
+                    trial_binary_valence = data.get("binary_valence")
+
+                    # --- Valence "νεκρή ζώνη" filtering (label-noise reduction) ---
+                    # Αποκλείει trials με valence πολύ κοντά στο decision
+                    # threshold (ασαφή/οριακά ground-truth labels) πριν το
+                    # windowing, ώστε ΚΑΝΕΝΑ downstream στάδιο (train/val/test)
+                    # να μην βλέπει ποτέ αυτά τα trials.
+                    margin = getattr(self.config, "VALENCE_MARGIN", 0.0)
+
+                    if margin and margin > 0.0 and trial_labels is not None:
+
+                        valence = trial_labels[:, 0]
+                        threshold = self.config.VALENCE_THRESHOLD
+
+                        keep_mask = np.abs(valence - threshold) >= margin
+
+                        n_dropped = int((~keep_mask).sum())
+
+                        if n_dropped > 0:
+                            logger.info(
+                                f"  Subject {sid}: dropping {n_dropped}/"
+                                f"{len(valence)} trials with valence in "
+                                f"[{threshold - margin:.1f}, {threshold + margin:.1f}] "
+                                f"(ασαφή/οριακά labels)."
+                            )
+
+                        eeg_data = eeg_data[keep_mask]
+                        eda_data = eda_data[keep_mask]
+                        ppg_data = ppg_data[keep_mask]
+                        trial_labels = trial_labels[keep_mask]
+
+                        if trial_binary_valence is not None:
+                            trial_binary_valence = trial_binary_valence[keep_mask]
+
                     self.subject_manager.add_subject(
                         subject_id=sid,
                         eeg=eeg_data,
                         eda=eda_data,
                         ppg=ppg_data,
-                        labels=data.get("labels"),
-                        binary_valence=data.get("binary_valence"),
+                        labels=trial_labels,
+                        binary_valence=trial_binary_valence,
                     )
             subject_dict = self.subject_manager.subjects if self.subject_manager.subjects else subjects
         else:
@@ -316,19 +396,26 @@ class DataPipeline:
 
         ############################################################
         # STEP 6
-        # Compute Subject Statistics
+        # Normalization protocol
         ############################################################
 
+        # ΔΙΟΡΘΩΣΗ (cross-subject generalization): πριν, μόνο τα train
+        # subjects έπαιρναν subject-level z-score (mean/std πάνω σε ΟΛΑ
+        # τα trials τους), ενώ τα validation/test subjects (άγνωστα, δεν
+        # υπάρχουν subject-level στατιστικά γι' αυτά) έκαναν fallback σε
+        # per-trial normalization. Αυτό δημιουργούσε ασυνέπεια πρωτοκόλλου
+        # ανάμεσα σε train και eval -- το μοντέλο έβλεπε στο training μια
+        # συστηματικά διαφορετική κατανομή scale/offset από αυτή που θα
+        # συναντήσει σε πραγματικά άγνωστα subjects. Η per-trial
+        # normalization είναι ήδη το ΜΟΝΑΔΙΚΟ πρωτόκολλο που δουλεύει σε
+        # unseen subjects (δεν χρειάζεται ιστορικό του subject), άρα
+        # εφαρμόζεται πλέον ομοιόμορφα σε train/validation/test -- ίδιο
+        # rationale με το GroupNorm αντί για BatchNorm στο EEG CNN
+        # encoder (subject-invariant, όχι population-statistics based).
         logger.info("")
         logger.info("======================================")
-        logger.info("Computing Subject Statistics")
+        logger.info("Normalization: per-trial (train/val/test, ίδιο πρωτόκολλο)")
         logger.info("======================================")
-
-        self.preprocessing.compute_subject_statistics(
-            train_subjects
-        )
-
-        logger.info("Subject statistics computed successfully.")
 
         ############################################################
         # STEP 7
@@ -690,6 +777,48 @@ class DataPipeline:
         logger.info("")
         logger.info("Datasets created successfully.")
 
+        if cache_path is not None:
+            logger.info(f"Saving pipeline cache -> {cache_path}")
+            with open(cache_path, "wb") as f:
+                pickle.dump({
+                    "train_dataset": train_dataset,
+                    "validation_dataset": validation_dataset,
+                    "test_dataset": test_dataset,
+                    "num_train_subjects": num_train_subjects,
+                    "num_validation_subjects": num_validation_subjects,
+                    "num_test_subjects": num_test_subjects,
+                    "num_train_windows": num_train_windows,
+                    "num_validation_windows": num_validation_windows,
+                    "num_test_windows": num_test_windows,
+                    "train_subject_ids": train_subject_ids,
+                }, f)
+
+        return self._build_loaders_and_return(
+            train_dataset=train_dataset,
+            validation_dataset=validation_dataset,
+            test_dataset=test_dataset,
+            num_train_subjects=num_train_subjects,
+            num_validation_subjects=num_validation_subjects,
+            num_test_subjects=num_test_subjects,
+            num_train_windows=num_train_windows,
+            num_validation_windows=num_validation_windows,
+            num_test_windows=num_test_windows,
+            train_subject_ids=train_subject_ids,
+        )
+
+    def _build_loaders_and_return(
+        self,
+        train_dataset,
+        validation_dataset,
+        test_dataset,
+        num_train_subjects,
+        num_validation_subjects,
+        num_test_subjects,
+        num_train_windows,
+        num_validation_windows,
+        num_test_windows,
+        train_subject_ids,
+    ):
         ############################################################
         # STEP 13
         # BUILD DATALOADERS
