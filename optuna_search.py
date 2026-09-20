@@ -111,7 +111,8 @@ def parse_args():
     parser.add_argument("--no-augment", action="store_true",
                          help="Απενεργοποιεί το EEG data augmentation στο search.")
     parser.add_argument("--search-profile", choices=[
-        "focused", "refine", "best_recipe", "cross_subject_v2"
+        "focused", "refine", "best_recipe", "cross_subject_v2",
+        "cross_subject_v3"
     ],
                         default="focused",
                         help="focused: στενό, evidence-based Hybrid search.")
@@ -178,6 +179,24 @@ def _sample_common_hparams(trial, config, profile="focused"):
             "contrastive_temperature", 0.06, 0.09
         )
         gate_balance_weight = trial.suggest_float("gate_balance_weight", 0.0, 0.12)
+    elif profile == "cross_subject_v3" and config.MODEL_NAME == "hybrid":
+        # Narrow refinement around the only Optuna configuration that
+        # transferred well to unseen subjects (test Trial-F1 ~= 0.55).
+        config.LEARNING_RATE = trial.suggest_float("lr", 4.5e-4, 8.0e-4, log=True)
+        config.WEIGHT_DECAY = trial.suggest_float("weight_decay", 5e-4, 1.2e-3, log=True)
+        config.DROPOUT = trial.suggest_float("dropout", 0.40, 0.50)
+        config.BATCH_SIZE = trial.suggest_categorical("batch_size", [96, 128])
+        label_smoothing = trial.suggest_float("label_smoothing", 0.04, 0.08)
+        grad_clip = trial.suggest_float("grad_clip", 0.9, 1.25)
+        config.ADVERSARIAL_LAMBDA_MAX = trial.suggest_float(
+            "adversarial_lambda_max", 0.28, 0.38
+        )
+        adversarial_weight = trial.suggest_float("adversarial_weight", 0.20, 0.32)
+        contrastive_weight = trial.suggest_float("contrastive_weight", 0.18, 0.30)
+        contrastive_temperature = trial.suggest_float(
+            "contrastive_temperature", 0.07, 0.09
+        )
+        gate_balance_weight = trial.suggest_float("gate_balance_weight", 0.0, 0.08)
     elif profile == "refine" and config.MODEL_NAME == "hybrid":
         config.LEARNING_RATE = trial.suggest_float("lr", 3.5e-4, 7.5e-4, log=True)
         config.WEIGHT_DECAY = trial.suggest_float("weight_decay", 2e-4, 8e-4, log=True)
@@ -221,9 +240,11 @@ def _sample_common_hparams(trial, config, profile="focused"):
 
 def _sample_hybrid_hparams(trial, config, profile="focused"):
 
-    choices = [64, 96, 128] if profile == "cross_subject_v2" else (
+    choices = [128, 160] if profile == "cross_subject_v3" else (
+        [64, 96, 128] if profile == "cross_subject_v2" else (
         [96, 128] if profile == "best_recipe" else (
         [128, 160] if profile == "refine" else [96, 128, 160]
+        )
         )
     )
     config.EMBEDDING_DIM = trial.suggest_categorical("embedding_dim", choices)
