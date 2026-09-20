@@ -136,6 +136,8 @@ def parse_args():
 
 def _sample_common_hparams(trial, config, profile="focused"):
 
+    gate_balance_weight = 0.0
+
     # Ranges narrowed γύρω από την περιοχή σύγκλισης των Top-5 trials
     # του hybrid_v2 study (βλ. optuna_best_params_hybrid.json) -- τα
     # καλύτερα trials είχαν όλα batch_size=128, embedding_dim>=96, και
