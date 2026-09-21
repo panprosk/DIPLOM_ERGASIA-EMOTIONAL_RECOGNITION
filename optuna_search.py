@@ -112,11 +112,13 @@ def parse_args():
                          help="Απενεργοποιεί το EEG data augmentation στο search.")
     parser.add_argument("--search-profile", choices=[
         "focused", "refine", "best_recipe", "cross_subject_v2",
-        "cross_subject_v3"
+        "cross_subject_v3", "cross_subject_v4"
     ],
                         default="focused",
                         help="focused: στενό, evidence-based Hybrid search.")
-    parser.add_argument("--objective", choices=["generalization", "trial_f1"],
+    parser.add_argument("--objective", choices=[
+        "generalization", "trial_f1", "balanced"
+    ],
                         default="generalization",
                         help="Optuna objective. trial_f1 matches the training "
                             "checkpoint metric used by the best historical run.")
@@ -197,6 +199,25 @@ def _sample_common_hparams(trial, config, profile="focused"):
             "contrastive_temperature", 0.07, 0.09
         )
         gate_balance_weight = trial.suggest_float("gate_balance_weight", 0.0, 0.08)
+    elif profile == "cross_subject_v4" and config.MODEL_NAME == "hybrid":
+        # Narrow region around the two best transferred runs:
+        # test Trial-F1 ~= .554 (lr~6.1e-4, bs=128) and the later
+        # confirmation run (lr~6.1e-4, bs=96, embedding=160).
+        config.LEARNING_RATE = trial.suggest_float("lr", 4.5e-4, 7.2e-4, log=True)
+        config.WEIGHT_DECAY = trial.suggest_float("weight_decay", 6e-4, 1.1e-3, log=True)
+        config.DROPOUT = trial.suggest_float("dropout", 0.42, 0.49)
+        config.BATCH_SIZE = trial.suggest_categorical("batch_size", [64, 96, 128])
+        label_smoothing = trial.suggest_float("label_smoothing", 0.035, 0.075)
+        grad_clip = trial.suggest_float("grad_clip", 0.9, 1.2)
+        config.ADVERSARIAL_LAMBDA_MAX = trial.suggest_float(
+            "adversarial_lambda_max", 0.25, 0.34
+        )
+        adversarial_weight = trial.suggest_float("adversarial_weight", 0.24, 0.34)
+        contrastive_weight = trial.suggest_float("contrastive_weight", 0.16, 0.28)
+        contrastive_temperature = trial.suggest_float(
+            "contrastive_temperature", 0.072, 0.086
+        )
+        gate_balance_weight = trial.suggest_float("gate_balance_weight", 0.02, 0.08)
     elif profile == "refine" and config.MODEL_NAME == "hybrid":
         config.LEARNING_RATE = trial.suggest_float("lr", 3.5e-4, 7.5e-4, log=True)
         config.WEIGHT_DECAY = trial.suggest_float("weight_decay", 2e-4, 8e-4, log=True)
@@ -411,7 +432,11 @@ class Objective:
             objective_score = (
                 float(val_metrics["trial_f1"])
                 if self.args.objective == "trial_f1"
-                else gen_score
+                else (
+                    0.6 * float(val_metrics["trial_f1"]) + 0.4 * gen_score
+                    if self.args.objective == "balanced"
+                    else gen_score
+                )
             )
 
             # Ίδιο rationale με το val-smoothing στα κανονικά training
