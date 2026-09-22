@@ -17,10 +17,9 @@ Architecture (βλ. σημειώσεις χρήστη #8-13)
 κάθε branch να εκπαιδεύεται με ουσιαστική supervision -- ακριβώς όπως
 το paper εκπαιδεύει EEG/PPG/GSR LSTMs "παράλληλα").
 
-Μετά το stacked LSTM εφαρμόζεται temporal attention πάνω σε όλα τα
-hidden states της ακολουθίας. Έτσι το branch δεν περιορίζεται στο
-τελευταίο hidden state, αλλά μαθαίνει ποια χρονικά σημεία του trial
-είναι πιο χρήσιμα για την ταξινόμηση.
+Η αρχιτεκτονική του branch μπορεί να χρησιμοποιεί είτε το τελευταίο
+BiLSTM hidden representation είτε temporal attention πάνω σε όλα τα
+hidden states, ανάλογα με το πείραμα.
 
 Fusion: αντί να εκπαιδεύσουμε 3 (ή 6, valence+arousal) εντελώς χωριστά
 μοντέλα και μετά να τα συνδυάσουμε offline (όπως κάνει το paper), εδώ
@@ -47,9 +46,9 @@ import torch.nn.functional as F
 
 class ModalityLSTMBranch(nn.Module):
     """
-    2-layer stacked BiLSTM (80 -> 30 units, όπως στο paper) και temporal
-    attention πάνω σε μία ακολουθία window-features ενός modality, με
-    δύο ξεχωριστά binary heads (valence, arousal).
+    2-layer stacked BiLSTM (80 -> 30 units, όπως στο paper) πάνω σε μία
+    ακολουθία window-features ενός modality, με δύο ξεχωριστά binary
+    heads (valence, arousal).
     """
 
     def __init__(
@@ -68,8 +67,6 @@ class ModalityLSTMBranch(nn.Module):
         self.lstm2 = nn.LSTM(
             hidden1 * 2, hidden2, batch_first=True, bidirectional=True
         )
-        self.temporal_attention = nn.Linear(hidden2 * 2, 1)
-
         self.dropout = nn.Dropout(dropout)
 
         self.valence_head = nn.Linear(hidden2 * 2, num_classes)
@@ -83,23 +80,19 @@ class ModalityLSTMBranch(nn.Module):
         -------
         valence_logits : (batch, num_classes)
         arousal_logits : (batch, num_classes)
-        embedding      : (batch, hidden2)  -- attention-weighted representation
-        attention      : (batch, seq_len) -- temporal attention weights
+        embedding      : (batch, hidden2 * 2) -- final bidirectional state
         """
 
         out, _ = self.lstm1(sequence)
-        out, _ = self.lstm2(out)
-
-        attention_scores = self.temporal_attention(out).squeeze(-1)
-        attention_weights = F.softmax(attention_scores, dim=1)
-        embedding = torch.sum(out * attention_weights.unsqueeze(-1), dim=1)
+        _, (h_n, _) = self.lstm2(out)
+        embedding = torch.cat([h_n[-2], h_n[-1]], dim=-1)
 
         embedding = self.dropout(embedding)
 
         valence_logits = self.valence_head(embedding)
         arousal_logits = self.arousal_head(embedding)
 
-        return valence_logits, arousal_logits, embedding, attention_weights
+        return valence_logits, arousal_logits, embedding
 
 
 class PaperLSTMFusionModel(nn.Module):
@@ -143,9 +136,9 @@ class PaperLSTMFusionModel(nn.Module):
         ppg : (batch, seq_len, ppg_feature_dim)
         """
 
-        v_eeg, a_eeg, emb_eeg, attn_eeg = self.eeg_branch(eeg)
-        v_eda, a_eda, emb_eda, attn_eda = self.eda_branch(eda)
-        v_ppg, a_ppg, emb_ppg, attn_ppg = self.ppg_branch(ppg)
+        v_eeg, a_eeg, emb_eeg = self.eeg_branch(eeg)
+        v_eda, a_eda, emb_eda = self.eda_branch(eda)
+        v_ppg, a_ppg, emb_ppg = self.ppg_branch(ppg)
 
         valence_probs_per_branch = torch.stack(
             [F.softmax(v_eeg, dim=-1), F.softmax(v_eda, dim=-1), F.softmax(v_ppg, dim=-1)],
@@ -175,9 +168,4 @@ class PaperLSTMFusionModel(nn.Module):
             "arousal_branch_logits": {"eeg": a_eeg, "eda": a_eda, "ppg": a_ppg},
             "valence_fusion_weights": valence_weights,
             "arousal_fusion_weights": arousal_weights,
-            "temporal_attention": {
-                "eeg": attn_eeg,
-                "eda": attn_eda,
-                "ppg": attn_ppg,
-            },
         }
