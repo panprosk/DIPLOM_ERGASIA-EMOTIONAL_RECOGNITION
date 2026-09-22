@@ -112,7 +112,7 @@ def parse_args():
                          help="Απενεργοποιεί το EEG data augmentation στο search.")
     parser.add_argument("--search-profile", choices=[
         "focused", "refine", "best_recipe", "cross_subject_v2",
-        "cross_subject_v3", "cross_subject_v4"
+        "cross_subject_v3", "cross_subject_v4", "transformer_v2"
     ],
                         default="focused",
                         help="focused: στενό, evidence-based Hybrid search.")
@@ -146,7 +146,22 @@ def _sample_common_hparams(trial, config, profile="focused"):
     # καλύτερα trials είχαν όλα batch_size=128, embedding_dim>=96, και
     # label_smoothing χαμηλό. Στόχος: λιγότερα trials σπαταλημένα σε
     # ήδη αποδεδειγμένα χειρότερες περιοχές (bs=32/48, embedding_dim=64).
-    if profile == "best_recipe" and config.MODEL_NAME == "hybrid":
+    if profile == "transformer_v2" and config.MODEL_NAME != "hybrid":
+        config.LEARNING_RATE = trial.suggest_float("lr", 5e-4, 1.2e-3, log=True)
+        config.WEIGHT_DECAY = trial.suggest_float("weight_decay", 2e-4, 8e-4, log=True)
+        config.DROPOUT = trial.suggest_float("dropout", 0.25, 0.35)
+        config.BATCH_SIZE = trial.suggest_categorical("batch_size", [64, 96])
+        label_smoothing = trial.suggest_float("label_smoothing", 0.05, 0.12)
+        grad_clip = trial.suggest_float("grad_clip", 0.8, 1.3)
+        config.ADVERSARIAL_LAMBDA_MAX = trial.suggest_float(
+            "adversarial_lambda_max", 0.22, 0.34
+        )
+        adversarial_weight = trial.suggest_float("adversarial_weight", 0.20, 0.35)
+        contrastive_weight = trial.suggest_float("contrastive_weight", 0.12, 0.25)
+        contrastive_temperature = trial.suggest_float(
+            "contrastive_temperature", 0.06, 0.09
+        )
+    elif profile == "best_recipe" and config.MODEL_NAME == "hybrid":
         config.LEARNING_RATE = trial.suggest_float("lr", 1.5e-4, 4.5e-4, log=True)
         config.WEIGHT_DECAY = trial.suggest_float("weight_decay", 5e-4, 1.5e-3, log=True)
         config.DROPOUT = trial.suggest_float("dropout", 0.25, 0.40)
@@ -279,11 +294,18 @@ def _sample_transformer_hparams(trial, config):
     # 4/5 -- κλειδώνουμε αυτά, στενεύουμε τα υπόλοιπα γύρω από το
     # παρατηρημένο εύρος, ώστε τα νέα trials να μην ξοδεύονται σε ήδη
     # αποδεδειγμένα χειρότερες περιοχές του search space.
-    config.TRANSFORMER_D_MODEL = trial.suggest_categorical("d_model", [32, 64])
-    config.TRANSFORMER_NUM_HEADS = trial.suggest_categorical("num_heads", [2, 4])
-    config.TRANSFORMER_SELF_ATTN_LAYERS = trial.suggest_int("self_attn_layers", 2, 4)
-    config.TRANSFORMER_CROSS_ATTN_LAYERS = trial.suggest_int("cross_attn_layers", 1, 2)
-    config.TRANSFORMER_PATCH_SIZE = trial.suggest_categorical("patch_size", [32, 48])
+    if getattr(config, "_search_profile", None) == "transformer_v2":
+        config.TRANSFORMER_D_MODEL = trial.suggest_categorical("d_model", [32, 64])
+        config.TRANSFORMER_NUM_HEADS = trial.suggest_categorical("num_heads", [2, 4])
+        config.TRANSFORMER_SELF_ATTN_LAYERS = trial.suggest_int("self_attn_layers", 2, 3)
+        config.TRANSFORMER_CROSS_ATTN_LAYERS = trial.suggest_int("cross_attn_layers", 1, 2)
+        config.TRANSFORMER_PATCH_SIZE = 32
+    else:
+        config.TRANSFORMER_D_MODEL = trial.suggest_categorical("d_model", [32, 64])
+        config.TRANSFORMER_NUM_HEADS = trial.suggest_categorical("num_heads", [2, 4])
+        config.TRANSFORMER_SELF_ATTN_LAYERS = trial.suggest_int("self_attn_layers", 2, 4)
+        config.TRANSFORMER_CROSS_ATTN_LAYERS = trial.suggest_int("cross_attn_layers", 1, 2)
+        config.TRANSFORMER_PATCH_SIZE = trial.suggest_categorical("patch_size", [32, 48])
 
     ff_mult = trial.suggest_categorical("ff_mult", [2, 4])
     config.TRANSFORMER_FF_DIM = ff_mult * config.TRANSFORMER_D_MODEL
@@ -296,7 +318,11 @@ def _sample_transformer_hparams(trial, config):
     # train_cross_attention_transformer.py). Εύρος γύρω από το
     # production default (0.05) που επιβεβαιώθηκε να δίνει υγιές
     # (όχι πλήρως uniform ούτε πλήρως collapsed) attention pattern.
-    attn_entropy_weight = trial.suggest_float("attn_entropy_weight", 0.02, 0.10)
+    attn_entropy_weight = trial.suggest_float(
+        "attn_entropy_weight", 0.0, 0.06
+        if getattr(config, "_search_profile", None) == "transformer_v2"
+        else 0.10
+    )
 
     return {"attn_entropy_weight": attn_entropy_weight}
 
@@ -334,6 +360,7 @@ class Objective:
     def __call__(self, trial):
 
         config = copy.deepcopy(self.base_config)
+        config._search_profile = self.args.search_profile
 
         extra = _sample_common_hparams(
             trial, config, profile=self.args.search_profile
@@ -402,15 +429,13 @@ class Objective:
                 adversarial_weight=extra["adversarial_weight"],
                 contrastive_loss_fn=contrastive_loss_fn,
                 contrastive_weight=extra["contrastive_weight"],
-                gate_balance_weight=extra["gate_balance_weight"],
                 heartbeat_every=0,
             )
-            if self.args.model != "hybrid":
-                # Το run_epoch του hybrid script δεν δέχεται
-                # attn_entropy_weight (είναι ειδικό στο cross-attention
-                # μοντέλο) -- περνιέται μόνο όταν κάνουμε search πάνω
-                # στον Transformer, ώστε να είναι consistent με το
-                # production default (0.05) του training script.
+            if self.args.model == "hybrid":
+                run_epoch_kwargs["gate_balance_weight"] = extra["gate_balance_weight"]
+            else:
+                # Το attn_entropy_weight είναι ειδικό στο cross-attention
+                # μοντέλο και περνιέται μόνο στο Transformer search.
                 run_epoch_kwargs["attn_entropy_weight"] = extra["attn_entropy_weight"]
 
             self.module.run_epoch(
