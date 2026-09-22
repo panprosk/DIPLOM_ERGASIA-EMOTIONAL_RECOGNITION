@@ -47,7 +47,7 @@ import torch.nn.functional as F
 
 class ModalityLSTMBranch(nn.Module):
     """
-    2-layer stacked LSTM (80 -> 30 units, όπως στο paper) και temporal
+    2-layer stacked BiLSTM (80 -> 30 units, όπως στο paper) και temporal
     attention πάνω σε μία ακολουθία window-features ενός modality, με
     δύο ξεχωριστά binary heads (valence, arousal).
     """
@@ -62,14 +62,18 @@ class ModalityLSTMBranch(nn.Module):
     ):
         super().__init__()
 
-        self.lstm1 = nn.LSTM(input_dim, hidden1, batch_first=True)
-        self.lstm2 = nn.LSTM(hidden1, hidden2, batch_first=True)
-        self.temporal_attention = nn.Linear(hidden2, 1)
+        self.lstm1 = nn.LSTM(
+            input_dim, hidden1, batch_first=True, bidirectional=True
+        )
+        self.lstm2 = nn.LSTM(
+            hidden1 * 2, hidden2, batch_first=True, bidirectional=True
+        )
+        self.temporal_attention = nn.Linear(hidden2 * 2, 1)
 
         self.dropout = nn.Dropout(dropout)
 
-        self.valence_head = nn.Linear(hidden2, num_classes)
-        self.arousal_head = nn.Linear(hidden2, num_classes)
+        self.valence_head = nn.Linear(hidden2 * 2, num_classes)
+        self.arousal_head = nn.Linear(hidden2 * 2, num_classes)
 
     def forward(self, sequence: torch.Tensor):
         """
