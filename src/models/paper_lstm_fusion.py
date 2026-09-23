@@ -21,12 +21,10 @@ Architecture (βλ. σημειώσεις χρήστη #8-13)
 BiLSTM hidden representation είτε temporal attention πάνω σε όλα τα
 hidden states, ανάλογα με το πείραμα.
 
-Fusion: αντί να εκπαιδεύσουμε 3 (ή 6, valence+arousal) εντελώς χωριστά
-μοντέλα και μετά να τα συνδυάσουμε offline (όπως κάνει το paper), εδώ
-υλοποιείται ένα ενιαίο, end-to-end εκπαιδεύσιμο "weighted probability
-fusion" (Section 14.Β του paper) μέσω ενός μικρού softmax-normalized
-learnable βάρους ανά modality/task -- πρακτικά ισοδύναμο αλλά πιο
-αποδοτικό (ένα training run αντί για 6).
+Fusion: αντί για σταθερά modality weights, το Experiment C χρησιμοποιεί
+sample-dependent softmax gates πάνω στις τρεις modality representations.
+Έτσι το μοντέλο μπορεί να δίνει διαφορετική βαρύτητα σε EEG, EDA και PPG
+ανά trial, πριν από τα τελικά valence/arousal heads.
 
 Deviations από το paper (τεκμηριωμένες, βλ. συζήτηση με τον χρήστη)
 --------------------------------------------------------------------
@@ -123,11 +121,13 @@ class PaperLSTMFusionModel(nn.Module):
             ppg_feature_dim, hidden1, hidden2, dropout, num_classes
         )
 
-        # Weighted probability fusion (Section 14.Β): ένα learnable
-        # βάρος ανά modality, ξεχωριστά για valence και arousal,
-        # κανονικοποιημένο με softmax ώστε να αθροίζει σε 1.
-        self.valence_fusion_weights = nn.Parameter(torch.ones(3))
-        self.arousal_fusion_weights = nn.Parameter(torch.ones(3))
+        representation_dim = hidden2 * 2
+        fusion_input_dim = representation_dim * 3
+
+        self.valence_gate = nn.Linear(fusion_input_dim, 3)
+        self.arousal_gate = nn.Linear(fusion_input_dim, 3)
+        self.valence_fusion_head = nn.Linear(representation_dim, num_classes)
+        self.arousal_fusion_head = nn.Linear(representation_dim, num_classes)
 
     def forward(self, eeg: torch.Tensor, eda: torch.Tensor, ppg: torch.Tensor) -> dict:
         """
@@ -140,32 +140,33 @@ class PaperLSTMFusionModel(nn.Module):
         v_eda, a_eda, emb_eda = self.eda_branch(eda)
         v_ppg, a_ppg, emb_ppg = self.ppg_branch(ppg)
 
-        valence_probs_per_branch = torch.stack(
-            [F.softmax(v_eeg, dim=-1), F.softmax(v_eda, dim=-1), F.softmax(v_ppg, dim=-1)],
-            dim=1,
-        )  # (batch, 3, num_classes)
+        modality_embeddings = torch.stack(
+            [emb_eeg, emb_eda, emb_ppg], dim=1
+        )  # (batch, 3, representation_dim)
+        gate_input = torch.cat([emb_eeg, emb_eda, emb_ppg], dim=-1)
 
-        arousal_probs_per_branch = torch.stack(
-            [F.softmax(a_eeg, dim=-1), F.softmax(a_eda, dim=-1), F.softmax(a_ppg, dim=-1)],
-            dim=1,
-        )
+        valence_gate = F.softmax(self.valence_gate(gate_input), dim=-1)
+        arousal_gate = F.softmax(self.arousal_gate(gate_input), dim=-1)
 
-        valence_weights = F.softmax(self.valence_fusion_weights, dim=0)  # (3,)
-        arousal_weights = F.softmax(self.arousal_fusion_weights, dim=0)
-
-        fused_valence_probs = (
-            valence_probs_per_branch * valence_weights.view(1, 3, 1)
-        ).sum(dim=1)  # (batch, num_classes)
-
-        fused_arousal_probs = (
-            arousal_probs_per_branch * arousal_weights.view(1, 3, 1)
+        fused_valence_embedding = (
+            modality_embeddings * valence_gate.unsqueeze(-1)
+        ).sum(dim=1)
+        fused_arousal_embedding = (
+            modality_embeddings * arousal_gate.unsqueeze(-1)
         ).sum(dim=1)
 
+        fused_valence_logits = self.valence_fusion_head(
+            fused_valence_embedding
+        )
+        fused_arousal_logits = self.arousal_fusion_head(
+            fused_arousal_embedding
+        )
+
         return {
-            "valence_probs": fused_valence_probs,
-            "arousal_probs": fused_arousal_probs,
+            "valence_probs": F.softmax(fused_valence_logits, dim=-1),
+            "arousal_probs": F.softmax(fused_arousal_logits, dim=-1),
             "valence_branch_logits": {"eeg": v_eeg, "eda": v_eda, "ppg": v_ppg},
             "arousal_branch_logits": {"eeg": a_eeg, "eda": a_eda, "ppg": a_ppg},
-            "valence_fusion_weights": valence_weights,
-            "arousal_fusion_weights": arousal_weights,
+            "valence_gate_weights": valence_gate,
+            "arousal_gate_weights": arousal_gate,
         }

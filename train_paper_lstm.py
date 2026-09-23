@@ -1127,7 +1127,7 @@ def main():
         print("=" * 80)
 
     # ============================================================
-    # FUSION WEIGHTS
+    # SAMPLE-DEPENDENT MODALITY GATES
     # ============================================================
 
     with torch.no_grad():
@@ -1142,14 +1142,17 @@ def main():
             sample["ppg"].to(device)
         )
 
+        valence_gate_mean = out["valence_gate_weights"].mean(dim=0)
+        arousal_gate_mean = out["arousal_gate_weights"].mean(dim=0)
+
         print(
-            "\nValence fusion weights (EEG,EDA,PPG): "
-        f"{out['valence_fusion_weights'].detach().cpu().numpy()}"
+            "\nMean valence gates (EEG,EDA,PPG): "
+            f"{valence_gate_mean.detach().cpu().numpy()}"
         )
 
         print(
-           "Arousal fusion weights (EEG,EDA,PPG): "
-        f"{out['arousal_fusion_weights'].detach().cpu().numpy()}"
+            "Mean arousal gates (EEG,EDA,PPG): "
+            f"{arousal_gate_mean.detach().cpu().numpy()}"
         )
 
     print(
