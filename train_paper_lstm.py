@@ -1142,16 +1142,24 @@ def main():
             sample["ppg"].to(device)
         )
 
-        valence_gate_mean = out["valence_gate_weights"].mean(dim=0)
-        arousal_gate_mean = out["arousal_gate_weights"].mean(dim=0)
+        if "valence_gate_weights" in out:
+            valence_gate_mean = out["valence_gate_weights"].mean(dim=0)
+            arousal_gate_mean = out["arousal_gate_weights"].mean(dim=0)
+            gate_label = "Mean modality gates"
+        else:
+            # Compatibility with checkpoints/models from the static-fusion
+            # experiments (Baseline, A and B).
+            valence_gate_mean = out["valence_fusion_weights"]
+            arousal_gate_mean = out["arousal_fusion_weights"]
+            gate_label = "Static fusion weights"
 
         print(
-            "\nMean valence gates (EEG,EDA,PPG): "
+            f"\n{gate_label} - valence (EEG,EDA,PPG): "
             f"{valence_gate_mean.detach().cpu().numpy()}"
         )
 
         print(
-            "Mean arousal gates (EEG,EDA,PPG): "
+            f"{gate_label} - arousal (EEG,EDA,PPG): "
             f"{arousal_gate_mean.detach().cpu().numpy()}"
         )
 
