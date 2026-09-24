@@ -116,6 +116,16 @@ def parse_args():
     )
 
     parser.add_argument(
+        "--gate-entropy-weight",
+        type=float,
+        default=0.0,
+        help=(
+            "Βάρος entropy regularization στα sample-dependent "
+            "modality gates. 0.0 = απενεργοποιημένο."
+        ),
+    )
+
+    parser.add_argument(
         "--patience",
         type=int,
         default=12,
@@ -278,7 +288,8 @@ def run_epoch(
     arousal_criterion=None,
     aux_weight: float = 0.30,
     arousal_weight: float = 1.0,
-    grad_clip: float = 1.0
+    grad_clip: float = 1.0,
+    gate_entropy_weight: float = 0.0,
 ):
 
     is_train = optimizer is not None
@@ -408,6 +419,21 @@ def run_epoch(
                     + arousal_weight * aux_arousal_loss
                 )
             )
+
+            if is_train and gate_entropy_weight > 0.0:
+                valence_gate = output.get("valence_gate_weights")
+                arousal_gate = output.get("arousal_gate_weights")
+                if valence_gate is not None and arousal_gate is not None:
+                    eps = 1e-8
+                    valence_entropy = -(
+                        valence_gate * torch.log(valence_gate + eps)
+                    ).sum(dim=-1).mean()
+                    arousal_entropy = -(
+                        arousal_gate * torch.log(arousal_gate + eps)
+                    ).sum(dim=-1).mean()
+                    loss = loss - gate_entropy_weight * (
+                        valence_entropy + arousal_entropy
+                    )
 
             if is_train:
 
@@ -765,6 +791,7 @@ def main():
             args.aux_weight,
             args.arousal_weight,
             args.grad_clip,
+            args.gate_entropy_weight,
         )
 
         val_metrics = run_epoch(
@@ -777,6 +804,7 @@ def main():
             args.aux_weight,
             args.arousal_weight,
             args.grad_clip,
+            args.gate_entropy_weight,
         )
 
         valence_score = compute_generalization_score(
@@ -904,6 +932,7 @@ def main():
             args.aux_weight,
             args.arousal_weight,
             args.grad_clip,
+            args.gate_entropy_weight,
         )
 
         val_arousal = val_best_metrics["arousal"]
@@ -1043,6 +1072,7 @@ def main():
         args.aux_weight,
         args.arousal_weight,
         args.grad_clip,
+        args.gate_entropy_weight,
     )
 
     print(
@@ -1127,41 +1157,63 @@ def main():
         print("=" * 80)
 
     # ============================================================
-    # SAMPLE-DEPENDENT MODALITY GATES
+    # SAMPLE-DEPENDENT MODALITY GATE DIAGNOSTICS
     # ============================================================
 
+    model.eval()
+    all_valence_gates = []
+    all_arousal_gates = []
+
     with torch.no_grad():
+        for batch in test_loader:
+            out = model(
+                batch["eeg"].to(device),
+                batch["eda"].to(device),
+                batch["ppg"].to(device),
+            )
 
-        sample = next(
-            iter(test_loader)
-        )
+            if "valence_gate_weights" in out:
+                all_valence_gates.append(
+                    out["valence_gate_weights"].detach().cpu().numpy()
+                )
+                all_arousal_gates.append(
+                    out["arousal_gate_weights"].detach().cpu().numpy()
+                )
 
-        out = model(
-            sample["eeg"].to(device),
-            sample["eda"].to(device),
-            sample["ppg"].to(device)
-        )
+    if all_valence_gates:
+        valence_gates = np.concatenate(all_valence_gates, axis=0)
+        arousal_gates = np.concatenate(all_arousal_gates, axis=0)
+        modality_names = ("EEG", "EDA", "PPG")
 
-        if "valence_gate_weights" in out:
-            valence_gate_mean = out["valence_gate_weights"].mean(dim=0)
-            arousal_gate_mean = out["arousal_gate_weights"].mean(dim=0)
-            gate_label = "Mean modality gates"
-        else:
-            # Compatibility with checkpoints/models from the static-fusion
-            # experiments (Baseline, A and B).
-            valence_gate_mean = out["valence_fusion_weights"]
-            arousal_gate_mean = out["arousal_fusion_weights"]
-            gate_label = "Static fusion weights"
+        print("\n" + "=" * 80)
+        print("SAMPLE-DEPENDENT MODALITY GATE DIAGNOSTICS")
+        print("=" * 80)
 
-        print(
-            f"\n{gate_label} - valence (EEG,EDA,PPG): "
-            f"{valence_gate_mean.detach().cpu().numpy()}"
-        )
+        for task_name, gates in (
+            ("Valence", valence_gates),
+            ("Arousal", arousal_gates),
+        ):
+            print(f"\n{task_name} gates:")
+            for i, modality in enumerate(modality_names):
+                print(
+                    f"  {modality}: "
+                    f"mean={gates[:, i].mean():.4f}, "
+                    f"std={gates[:, i].std():.4f}, "
+                    f"min={gates[:, i].min():.4f}, "
+                    f"max={gates[:, i].max():.4f}"
+                )
 
-        print(
-            f"{gate_label} - arousal (EEG,EDA,PPG): "
-            f"{arousal_gate_mean.detach().cpu().numpy()}"
-        )
+            entropy = -(
+                gates * np.log(gates + 1e-8)
+            ).sum(axis=1)
+            print(
+                f"  Entropy: mean={entropy.mean():.4f}, "
+                f"std={entropy.std():.4f}, "
+                f"min={entropy.min():.4f}, "
+                f"max={entropy.max():.4f}"
+            )
+
+        print("=" * 80)
 
     print(
         "=" * 80
