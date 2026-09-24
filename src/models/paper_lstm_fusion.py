@@ -17,9 +17,9 @@ Architecture (βλ. σημειώσεις χρήστη #8-13)
 κάθε branch να εκπαιδεύεται με ουσιαστική supervision -- ακριβώς όπως
 το paper εκπαιδεύει EEG/PPG/GSR LSTMs "παράλληλα").
 
-Η αρχιτεκτονική του branch μπορεί να χρησιμοποιεί είτε το τελευταίο
-BiLSTM hidden representation είτε temporal attention πάνω σε όλα τα
-hidden states, ανάλογα με το πείραμα.
+Η αρχιτεκτονική του branch χρησιμοποιεί το τελευταίο hidden
+representation. Το Experiment C αλλάζει μόνο το multimodal fusion σε
+sample-dependent adaptive gates.
 
 Fusion: αντί για σταθερά modality weights, το Experiment C χρησιμοποιεί
 sample-dependent softmax gates πάνω στις τρεις modality representations.
@@ -44,7 +44,7 @@ import torch.nn.functional as F
 
 class ModalityLSTMBranch(nn.Module):
     """
-    2-layer stacked BiLSTM (80 -> 30 units, όπως στο paper) πάνω σε μία
+    2-layer stacked LSTM (80 -> 30 units, όπως στο paper) πάνω σε μία
     ακολουθία window-features ενός modality, με δύο ξεχωριστά binary
     heads (valence, arousal).
     """
@@ -59,16 +59,12 @@ class ModalityLSTMBranch(nn.Module):
     ):
         super().__init__()
 
-        self.lstm1 = nn.LSTM(
-            input_dim, hidden1, batch_first=True, bidirectional=True
-        )
-        self.lstm2 = nn.LSTM(
-            hidden1 * 2, hidden2, batch_first=True, bidirectional=True
-        )
+        self.lstm1 = nn.LSTM(input_dim, hidden1, batch_first=True)
+        self.lstm2 = nn.LSTM(hidden1, hidden2, batch_first=True)
         self.dropout = nn.Dropout(dropout)
 
-        self.valence_head = nn.Linear(hidden2 * 2, num_classes)
-        self.arousal_head = nn.Linear(hidden2 * 2, num_classes)
+        self.valence_head = nn.Linear(hidden2, num_classes)
+        self.arousal_head = nn.Linear(hidden2, num_classes)
 
     def forward(self, sequence: torch.Tensor):
         """
@@ -78,12 +74,12 @@ class ModalityLSTMBranch(nn.Module):
         -------
         valence_logits : (batch, num_classes)
         arousal_logits : (batch, num_classes)
-        embedding      : (batch, hidden2 * 2) -- final bidirectional state
+        embedding      : (batch, hidden2) -- final LSTM state
         """
 
         out, _ = self.lstm1(sequence)
         _, (h_n, _) = self.lstm2(out)
-        embedding = torch.cat([h_n[-2], h_n[-1]], dim=-1)
+        embedding = h_n[-1]
 
         embedding = self.dropout(embedding)
 
@@ -121,7 +117,7 @@ class PaperLSTMFusionModel(nn.Module):
             ppg_feature_dim, hidden1, hidden2, dropout, num_classes
         )
 
-        representation_dim = hidden2 * 2
+        representation_dim = hidden2
         fusion_input_dim = representation_dim * 3
 
         self.valence_gate = nn.Linear(fusion_input_dim, 3)
