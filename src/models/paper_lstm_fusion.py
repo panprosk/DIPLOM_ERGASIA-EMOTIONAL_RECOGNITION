@@ -174,6 +174,8 @@ class PaperLSTMFusionModel(nn.Module):
         return {
             "valence_probs": F.softmax(fused_valence_logits, dim=-1),
             "arousal_probs": F.softmax(fused_arousal_logits, dim=-1),
+            "valence_fused_embedding": fused_valence_embedding,
+            "arousal_fused_embedding": fused_arousal_embedding,
             "valence_branch_logits": {"eeg": v_eeg, "eda": v_eda, "ppg": v_ppg},
             "arousal_branch_logits": {"eeg": a_eeg, "eda": a_eda, "ppg": a_ppg},
             "valence_cross_attention_weights": valence_attention,

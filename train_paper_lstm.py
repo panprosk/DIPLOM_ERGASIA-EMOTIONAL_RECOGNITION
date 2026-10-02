@@ -126,6 +126,16 @@ def parse_args():
     )
 
     parser.add_argument(
+        "--coral-weight",
+        type=float,
+        default=0.0,
+        help=(
+            "Βάρος CORAL subject-alignment loss πάνω στα fused "
+            "valence/arousal embeddings. 0.0 = απενεργοποιημένο."
+        ),
+    )
+
+    parser.add_argument(
         "--patience",
         type=int,
         default=12,
@@ -290,6 +300,7 @@ def run_epoch(
     arousal_weight: float = 1.0,
     grad_clip: float = 1.0,
     gate_entropy_weight: float = 0.0,
+    coral_weight: float = 0.0,
 ):
 
     is_train = optimizer is not None
@@ -419,6 +430,60 @@ def run_epoch(
                     + arousal_weight * aux_arousal_loss
                 )
             )
+
+            if is_train and coral_weight > 0.0:
+                subject_labels = batch["subject"]
+                subject_groups = {}
+                for index, subject in enumerate(subject_labels):
+                    subject_groups.setdefault(subject, []).append(index)
+
+                def covariance(embeddings):
+                    centered = embeddings - embeddings.mean(dim=0, keepdim=True)
+                    return centered.transpose(0, 1).matmul(centered) / (
+                        embeddings.shape[0] - 1
+                    )
+
+                valence_covariances = []
+                arousal_covariances = []
+                for indices in subject_groups.values():
+                    if len(indices) < 2:
+                        continue
+                    index_tensor = torch.tensor(
+                        indices, device=device, dtype=torch.long
+                    )
+                    valence_covariances.append(
+                        covariance(
+                            output["valence_fused_embedding"].index_select(
+                                0, index_tensor
+                            )
+                        )
+                    )
+                    arousal_covariances.append(
+                        covariance(
+                            output["arousal_fused_embedding"].index_select(
+                                0, index_tensor
+                            )
+                        )
+                    )
+
+                if len(valence_covariances) >= 2:
+                    coral_losses = []
+                    for covariances in (
+                        valence_covariances,
+                        arousal_covariances,
+                    ):
+                        for first in range(len(covariances)):
+                            for second in range(first + 1, len(covariances)):
+                                coral_losses.append(
+                                    torch.mean(
+                                        (
+                                            covariances[first]
+                                            - covariances[second]
+                                        ) ** 2
+                                    )
+                                )
+                    coral_loss = torch.stack(coral_losses).mean()
+                    loss = loss + coral_weight * coral_loss
 
             if is_train and gate_entropy_weight > 0.0:
                 valence_gate = output.get("valence_gate_weights")
@@ -792,6 +857,7 @@ def main():
             args.arousal_weight,
             args.grad_clip,
             args.gate_entropy_weight,
+            args.coral_weight,
         )
 
         val_metrics = run_epoch(
@@ -805,6 +871,7 @@ def main():
             args.arousal_weight,
             args.grad_clip,
             args.gate_entropy_weight,
+            args.coral_weight,
         )
 
         valence_score = compute_generalization_score(
@@ -933,6 +1000,7 @@ def main():
             args.arousal_weight,
             args.grad_clip,
             args.gate_entropy_weight,
+            args.coral_weight,
         )
 
         val_arousal = val_best_metrics["arousal"]
@@ -1033,6 +1101,9 @@ def main():
             "aux_weight":
                 args.aux_weight,
 
+            "coral_weight":
+                args.coral_weight,
+
             "selection_metric":
                 args.selection_metric,
 
@@ -1073,6 +1144,7 @@ def main():
         args.arousal_weight,
         args.grad_clip,
         args.gate_entropy_weight,
+        args.coral_weight,
     )
 
     print(
