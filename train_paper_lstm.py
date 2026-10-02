@@ -1157,12 +1157,12 @@ def main():
         print("=" * 80)
 
     # ============================================================
-    # SAMPLE-DEPENDENT MODALITY GATE DIAGNOSTICS
+    # CROSS-MODAL ATTENTION DIAGNOSTICS
     # ============================================================
 
     model.eval()
-    all_valence_gates = []
-    all_arousal_gates = []
+    all_valence_attention = []
+    all_arousal_attention = []
 
     with torch.no_grad():
         for batch in test_loader:
@@ -1172,42 +1172,47 @@ def main():
                 batch["ppg"].to(device),
             )
 
-            if "valence_gate_weights" in out:
-                all_valence_gates.append(
-                    out["valence_gate_weights"].detach().cpu().numpy()
+            if "valence_cross_attention_weights" in out:
+                all_valence_attention.append(
+                    out["valence_cross_attention_weights"]
+                    .detach()
+                    .cpu()
+                    .numpy()
                 )
-                all_arousal_gates.append(
-                    out["arousal_gate_weights"].detach().cpu().numpy()
+                all_arousal_attention.append(
+                    out["arousal_cross_attention_weights"]
+                    .detach()
+                    .cpu()
+                    .numpy()
                 )
 
-    if all_valence_gates:
-        valence_gates = np.concatenate(all_valence_gates, axis=0)
-        arousal_gates = np.concatenate(all_arousal_gates, axis=0)
+    if all_valence_attention:
+        valence_attention = np.concatenate(all_valence_attention, axis=0)
+        arousal_attention = np.concatenate(all_arousal_attention, axis=0)
         modality_names = ("EEG", "EDA", "PPG")
 
         print("\n" + "=" * 80)
-        print("SAMPLE-DEPENDENT MODALITY GATE DIAGNOSTICS")
+        print("CROSS-MODAL ATTENTION DIAGNOSTICS")
         print("=" * 80)
 
-        for task_name, gates in (
-            ("Valence", valence_gates),
-            ("Arousal", arousal_gates),
+        for task_name, attention in (
+            ("Valence", valence_attention),
+            ("Arousal", arousal_attention),
         ):
-            print(f"\n{task_name} gates:")
+            mean_attention = attention.mean(axis=0)
+            entropy = -(
+                attention * np.log(attention + 1e-8)
+            ).sum(axis=-1)
+
+            print(f"\n{task_name} attention matrix (query rows -> key columns):")
+            print("      " + " ".join(f"{name:>8}" for name in modality_names))
             for i, modality in enumerate(modality_names):
                 print(
-                    f"  {modality}: "
-                    f"mean={gates[:, i].mean():.4f}, "
-                    f"std={gates[:, i].std():.4f}, "
-                    f"min={gates[:, i].min():.4f}, "
-                    f"max={gates[:, i].max():.4f}"
+                    f"  {modality:>3} "
+                    + " ".join(f"{value:8.4f}" for value in mean_attention[i])
                 )
-
-            entropy = -(
-                gates * np.log(gates + 1e-8)
-            ).sum(axis=1)
             print(
-                f"  Entropy: mean={entropy.mean():.4f}, "
+                f"  Row entropy: mean={entropy.mean():.4f}, "
                 f"std={entropy.std():.4f}, "
                 f"min={entropy.min():.4f}, "
                 f"max={entropy.max():.4f}"

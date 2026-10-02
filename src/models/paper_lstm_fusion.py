@@ -18,13 +18,13 @@ Architecture (βλ. σημειώσεις χρήστη #8-13)
 το paper εκπαιδεύει EEG/PPG/GSR LSTMs "παράλληλα").
 
 Η αρχιτεκτονική του branch χρησιμοποιεί το τελευταίο hidden
-representation. Το Experiment C αλλάζει μόνο το multimodal fusion σε
-sample-dependent adaptive gates.
+representation. Το Experiment D αλλάζει μόνο το multimodal fusion σε
+task-specific cross-modal attention.
 
-Fusion: αντί για σταθερά modality weights, το Experiment C χρησιμοποιεί
-sample-dependent softmax gates πάνω στις τρεις modality representations.
-Έτσι το μοντέλο μπορεί να δίνει διαφορετική βαρύτητα σε EEG, EDA και PPG
-ανά trial, πριν από τα τελικά valence/arousal heads.
+Fusion: το Experiment D χρησιμοποιεί ξεχωριστό cross-modal multi-head
+attention για valence και arousal πάνω στις τρεις modality
+representations. Έτσι κάθε task μπορεί να μοντελοποιεί διαφορετικές
+σχέσεις μεταξύ EEG, EDA και PPG πριν από τα τελικά heads.
 
 Deviations από το paper (τεκμηριωμένες, βλ. συζήτηση με τον χρήστη)
 --------------------------------------------------------------------
@@ -118,10 +118,18 @@ class PaperLSTMFusionModel(nn.Module):
         )
 
         representation_dim = hidden2
-        fusion_input_dim = representation_dim * 3
-
-        self.valence_gate = nn.Linear(fusion_input_dim, 3)
-        self.arousal_gate = nn.Linear(fusion_input_dim, 3)
+        self.valence_cross_attention = nn.MultiheadAttention(
+            embed_dim=representation_dim,
+            num_heads=4,
+            dropout=dropout,
+            batch_first=True,
+        )
+        self.arousal_cross_attention = nn.MultiheadAttention(
+            embed_dim=representation_dim,
+            num_heads=4,
+            dropout=dropout,
+            batch_first=True,
+        )
         self.valence_fusion_head = nn.Linear(representation_dim, num_classes)
         self.arousal_fusion_head = nn.Linear(representation_dim, num_classes)
 
@@ -139,17 +147,22 @@ class PaperLSTMFusionModel(nn.Module):
         modality_embeddings = torch.stack(
             [emb_eeg, emb_eda, emb_ppg], dim=1
         )  # (batch, 3, representation_dim)
-        gate_input = torch.cat([emb_eeg, emb_eda, emb_ppg], dim=-1)
 
-        valence_gate = F.softmax(self.valence_gate(gate_input), dim=-1)
-        arousal_gate = F.softmax(self.arousal_gate(gate_input), dim=-1)
+        attended_valence, valence_attention = self.valence_cross_attention(
+            modality_embeddings,
+            modality_embeddings,
+            modality_embeddings,
+            need_weights=True,
+        )
+        attended_arousal, arousal_attention = self.arousal_cross_attention(
+            modality_embeddings,
+            modality_embeddings,
+            modality_embeddings,
+            need_weights=True,
+        )
 
-        fused_valence_embedding = (
-            modality_embeddings * valence_gate.unsqueeze(-1)
-        ).sum(dim=1)
-        fused_arousal_embedding = (
-            modality_embeddings * arousal_gate.unsqueeze(-1)
-        ).sum(dim=1)
+        fused_valence_embedding = attended_valence.mean(dim=1)
+        fused_arousal_embedding = attended_arousal.mean(dim=1)
 
         fused_valence_logits = self.valence_fusion_head(
             fused_valence_embedding
@@ -163,6 +176,6 @@ class PaperLSTMFusionModel(nn.Module):
             "arousal_probs": F.softmax(fused_arousal_logits, dim=-1),
             "valence_branch_logits": {"eeg": v_eeg, "eda": v_eda, "ppg": v_ppg},
             "arousal_branch_logits": {"eeg": a_eeg, "eda": a_eda, "ppg": a_ppg},
-            "valence_gate_weights": valence_gate,
-            "arousal_gate_weights": arousal_gate,
+            "valence_cross_attention_weights": valence_attention,
+            "arousal_cross_attention_weights": arousal_attention,
         }
