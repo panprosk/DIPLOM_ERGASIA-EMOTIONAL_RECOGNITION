@@ -136,6 +136,16 @@ def parse_args():
     )
 
     parser.add_argument(
+        "--vrex-weight",
+        type=float,
+        default=0.0,
+        help=(
+            "Βάρος VREx loss: διακύμανση του ανά-subject training "
+            "loss. 0.0 = απενεργοποιημένο."
+        ),
+    )
+
+    parser.add_argument(
         "--patience",
         type=int,
         default=12,
@@ -301,6 +311,7 @@ def run_epoch(
     grad_clip: float = 1.0,
     gate_entropy_weight: float = 0.0,
     coral_weight: float = 0.0,
+    vrex_weight: float = 0.0,
 ):
 
     is_train = optimizer is not None
@@ -484,6 +495,84 @@ def run_epoch(
                                 )
                     coral_loss = torch.stack(coral_losses).mean()
                     loss = loss + coral_weight * coral_loss
+
+            if is_train and vrex_weight > 0.0:
+                subject_labels = batch["subject"]
+                subject_groups = {}
+                for index, subject in enumerate(subject_labels):
+                    subject_groups.setdefault(subject, []).append(index)
+
+                per_sample_loss = (
+                    torch.nn.functional.nll_loss(
+                        torch.log(
+                            output["valence_probs"].clamp_min(1e-8)
+                        ),
+                        valence,
+                        weight=(
+                            valence_criterion.weight
+                            if valence_criterion is not None
+                            else None
+                        ),
+                        reduction="none",
+                    )
+                    + arousal_weight * torch.nn.functional.nll_loss(
+                        torch.log(
+                            output["arousal_probs"].clamp_min(1e-8)
+                        ),
+                        arousal,
+                        weight=(
+                            arousal_criterion.weight
+                            if arousal_criterion is not None
+                            else None
+                        ),
+                        reduction="none",
+                    )
+                )
+
+                for key in ("eeg", "eda", "ppg"):
+                    per_sample_loss = (
+                        per_sample_loss
+                        + aux_weight * (
+                            torch.nn.functional.cross_entropy(
+                                output["valence_branch_logits"][key],
+                                valence,
+                                weight=(
+                                    valence_criterion.weight
+                                    if valence_criterion is not None
+                                    else None
+                                ),
+                                reduction="none",
+                            )
+                            + arousal_weight * torch.nn.functional.cross_entropy(
+                                output["arousal_branch_logits"][key],
+                                arousal,
+                                weight=(
+                                    arousal_criterion.weight
+                                    if arousal_criterion is not None
+                                    else None
+                                ),
+                                reduction="none",
+                            )
+                        )
+                    )
+
+                subject_losses = []
+                for indices in subject_groups.values():
+                    index_tensor = torch.tensor(
+                        indices, device=device, dtype=torch.long
+                    )
+                    subject_losses.append(
+                        per_sample_loss.index_select(
+                            0, index_tensor
+                        ).mean()
+                    )
+
+                if len(subject_losses) >= 2:
+                    vrex_loss = torch.var(
+                        torch.stack(subject_losses),
+                        unbiased=False,
+                    )
+                    loss = loss + vrex_weight * vrex_loss
 
             if is_train and gate_entropy_weight > 0.0:
                 valence_gate = output.get("valence_gate_weights")
@@ -858,6 +947,7 @@ def main():
             args.grad_clip,
             args.gate_entropy_weight,
             args.coral_weight,
+            args.vrex_weight,
         )
 
         val_metrics = run_epoch(
@@ -872,6 +962,7 @@ def main():
             args.grad_clip,
             args.gate_entropy_weight,
             args.coral_weight,
+            args.vrex_weight,
         )
 
         valence_score = compute_generalization_score(
@@ -1001,6 +1092,7 @@ def main():
             args.grad_clip,
             args.gate_entropy_weight,
             args.coral_weight,
+            args.vrex_weight,
         )
 
         val_arousal = val_best_metrics["arousal"]
@@ -1104,6 +1196,9 @@ def main():
             "coral_weight":
                 args.coral_weight,
 
+            "vrex_weight":
+                args.vrex_weight,
+
             "selection_metric":
                 args.selection_metric,
 
@@ -1145,6 +1240,7 @@ def main():
         args.grad_clip,
         args.gate_entropy_weight,
         args.coral_weight,
+       args.vrex_weight,
     )
 
     print(
