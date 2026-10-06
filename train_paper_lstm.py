@@ -136,6 +136,16 @@ def parse_args():
     )
 
     parser.add_argument(
+        "--class-conditional-coral-weight",
+        type=float,
+        default=0.0,
+        help=(
+            "Βάρος class-conditional CORAL loss πάνω στα fused "
+            "embeddings. 0.0 = απενεργοποιημένο."
+        ),
+    )
+
+    parser.add_argument(
         "--vrex-weight",
         type=float,
         default=0.0,
@@ -311,6 +321,7 @@ def run_epoch(
     grad_clip: float = 1.0,
     gate_entropy_weight: float = 0.0,
     coral_weight: float = 0.0,
+    class_conditional_coral_weight: float = 0.0,
     vrex_weight: float = 0.0,
 ):
 
@@ -495,6 +506,84 @@ def run_epoch(
                                 )
                     coral_loss = torch.stack(coral_losses).mean()
                     loss = loss + coral_weight * coral_loss
+
+            if is_train and class_conditional_coral_weight > 0.0:
+                subject_labels = batch["subject"]
+
+                def class_conditional_coral(
+                    embeddings,
+                    labels,
+                ):
+                    groups = {}
+                    for index, (subject, label) in enumerate(
+                        zip(subject_labels, labels.detach().cpu().tolist())
+                    ):
+                        groups.setdefault(
+                            (subject, int(label)), []
+                        ).append(index)
+
+                    covariances_by_class = {}
+                    for (subject, label), indices in groups.items():
+                        if len(indices) < 2:
+                            continue
+                        index_tensor = torch.tensor(
+                            indices, device=device, dtype=torch.long
+                        )
+                        samples = embeddings.index_select(
+                            0, index_tensor
+                        )
+                        centered = samples - samples.mean(
+                            dim=0, keepdim=True
+                        )
+                        covariance = centered.transpose(0, 1).matmul(
+                            centered
+                        ) / (samples.shape[0] - 1)
+                        covariances_by_class.setdefault(
+                            label, []
+                        ).append(covariance)
+
+                    losses = []
+                    for covariances in covariances_by_class.values():
+                        if len(covariances) < 2:
+                            continue
+                        for first in range(len(covariances)):
+                            for second in range(first + 1, len(covariances)):
+                                losses.append(
+                                    torch.mean(
+                                        (
+                                            covariances[first]
+                                            - covariances[second]
+                                        ) ** 2
+                                    )
+                                )
+
+                    if not losses:
+                        return None
+                    return torch.stack(losses).mean()
+
+                class_coral_losses = []
+                for embedding, labels in (
+                    (
+                        output["valence_fused_embedding"],
+                        valence,
+                    ),
+                    (
+                        output["arousal_fused_embedding"],
+                        arousal,
+                    ),
+                ):
+                    class_coral_loss = class_conditional_coral(
+                        embedding,
+                        labels,
+                    )
+                    if class_coral_loss is not None:
+                        class_coral_losses.append(class_coral_loss)
+
+                if class_coral_losses:
+                    loss = loss + (
+                        class_conditional_coral_weight
+                        * torch.stack(class_coral_losses).mean()
+                    )
 
             if is_train and vrex_weight > 0.0:
                 subject_labels = batch["subject"]
@@ -947,6 +1036,7 @@ def main():
             args.grad_clip,
             args.gate_entropy_weight,
             args.coral_weight,
+            args.class_conditional_coral_weight,
             args.vrex_weight,
         )
 
@@ -962,6 +1052,7 @@ def main():
             args.grad_clip,
             args.gate_entropy_weight,
             args.coral_weight,
+            args.class_conditional_coral_weight,
             args.vrex_weight,
         )
 
@@ -1092,6 +1183,7 @@ def main():
             args.grad_clip,
             args.gate_entropy_weight,
             args.coral_weight,
+            args.class_conditional_coral_weight,
             args.vrex_weight,
         )
 
@@ -1196,6 +1288,9 @@ def main():
             "coral_weight":
                 args.coral_weight,
 
+            "class_conditional_coral_weight":
+                args.class_conditional_coral_weight,
+
             "vrex_weight":
                 args.vrex_weight,
 
@@ -1240,6 +1335,7 @@ def main():
         args.grad_clip,
         args.gate_entropy_weight,
         args.coral_weight,
+       args.class_conditional_coral_weight,
        args.vrex_weight,
     )
 
