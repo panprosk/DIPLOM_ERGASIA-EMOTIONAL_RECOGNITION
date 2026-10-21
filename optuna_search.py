@@ -112,7 +112,8 @@ def parse_args():
                          help="Απενεργοποιεί το EEG data augmentation στο search.")
     parser.add_argument("--search-profile", choices=[
         "focused", "refine", "best_recipe", "cross_subject_v2",
-        "cross_subject_v3", "cross_subject_v4", "transformer_v2"
+        "cross_subject_v3", "cross_subject_v4", "transformer_v2",
+        "transformer_refine"
     ],
                         default="focused",
                         help="focused: στενό, evidence-based Hybrid search.")
@@ -146,21 +147,43 @@ def _sample_common_hparams(trial, config, profile="focused"):
     # καλύτερα trials είχαν όλα batch_size=128, embedding_dim>=96, και
     # label_smoothing χαμηλό. Στόχος: λιγότερα trials σπαταλημένα σε
     # ήδη αποδεδειγμένα χειρότερες περιοχές (bs=32/48, embedding_dim=64).
-    if profile == "transformer_v2" and config.MODEL_NAME != "hybrid":
-        config.LEARNING_RATE = trial.suggest_float("lr", 5e-4, 1.2e-3, log=True)
-        config.WEIGHT_DECAY = trial.suggest_float("weight_decay", 2e-4, 8e-4, log=True)
-        config.DROPOUT = trial.suggest_float("dropout", 0.25, 0.35)
-        config.BATCH_SIZE = trial.suggest_categorical("batch_size", [64, 96])
-        label_smoothing = trial.suggest_float("label_smoothing", 0.05, 0.12)
-        grad_clip = trial.suggest_float("grad_clip", 0.8, 1.3)
-        config.ADVERSARIAL_LAMBDA_MAX = trial.suggest_float(
-            "adversarial_lambda_max", 0.22, 0.34
-        )
-        adversarial_weight = trial.suggest_float("adversarial_weight", 0.20, 0.35)
-        contrastive_weight = trial.suggest_float("contrastive_weight", 0.12, 0.25)
-        contrastive_temperature = trial.suggest_float(
-            "contrastive_temperature", 0.06, 0.09
-        )
+    if profile in {"transformer_v2", "transformer_refine"} and config.MODEL_NAME != "hybrid":
+        if profile == "transformer_refine":
+            # Evidence-based refinement around the strongest historical
+            # transformer_v1 trials and the two-trial smoke study. The
+            # narrower transformer_v2 profile excluded their useful region
+            # (lower LR, higher regularization and stronger DANN).
+            config.LEARNING_RATE = trial.suggest_float("lr", 2e-4, 8e-4, log=True)
+            config.WEIGHT_DECAY = trial.suggest_float(
+                "weight_decay", 5e-5, 1e-3, log=True
+            )
+            config.DROPOUT = trial.suggest_float("dropout", 0.30, 0.45)
+            config.BATCH_SIZE = trial.suggest_categorical("batch_size", [64, 96, 128])
+            label_smoothing = trial.suggest_float("label_smoothing", 0.0, 0.08)
+            grad_clip = trial.suggest_float("grad_clip", 1.2, 1.9)
+            config.ADVERSARIAL_LAMBDA_MAX = trial.suggest_float(
+                "adversarial_lambda_max", 0.28, 0.48
+            )
+            adversarial_weight = trial.suggest_float("adversarial_weight", 0.15, 0.40)
+            contrastive_weight = trial.suggest_float("contrastive_weight", 0.05, 0.30)
+            contrastive_temperature = trial.suggest_float(
+                "contrastive_temperature", 0.08, 0.15
+            )
+        else:
+            config.LEARNING_RATE = trial.suggest_float("lr", 5e-4, 1.2e-3, log=True)
+            config.WEIGHT_DECAY = trial.suggest_float("weight_decay", 2e-4, 8e-4, log=True)
+            config.DROPOUT = trial.suggest_float("dropout", 0.25, 0.35)
+            config.BATCH_SIZE = trial.suggest_categorical("batch_size", [64, 96])
+            label_smoothing = trial.suggest_float("label_smoothing", 0.05, 0.12)
+            grad_clip = trial.suggest_float("grad_clip", 0.8, 1.3)
+            config.ADVERSARIAL_LAMBDA_MAX = trial.suggest_float(
+                "adversarial_lambda_max", 0.22, 0.34
+            )
+            adversarial_weight = trial.suggest_float("adversarial_weight", 0.20, 0.35)
+            contrastive_weight = trial.suggest_float("contrastive_weight", 0.12, 0.25)
+            contrastive_temperature = trial.suggest_float(
+                "contrastive_temperature", 0.06, 0.09
+            )
     elif profile == "best_recipe" and config.MODEL_NAME == "hybrid":
         config.LEARNING_RATE = trial.suggest_float("lr", 1.5e-4, 4.5e-4, log=True)
         config.WEIGHT_DECAY = trial.suggest_float("weight_decay", 5e-4, 1.5e-3, log=True)
@@ -294,10 +317,14 @@ def _sample_transformer_hparams(trial, config):
     # 4/5 -- κλειδώνουμε αυτά, στενεύουμε τα υπόλοιπα γύρω από το
     # παρατηρημένο εύρος, ώστε τα νέα trials να μην ξοδεύονται σε ήδη
     # αποδεδειγμένα χειρότερες περιοχές του search space.
-    if getattr(config, "_search_profile", None) == "transformer_v2":
+    if getattr(config, "_search_profile", None) in {
+        "transformer_v2", "transformer_refine"
+    }:
         config.TRANSFORMER_D_MODEL = trial.suggest_categorical("d_model", [32, 64])
         config.TRANSFORMER_NUM_HEADS = trial.suggest_categorical("num_heads", [2, 4])
-        config.TRANSFORMER_SELF_ATTN_LAYERS = trial.suggest_int("self_attn_layers", 2, 3)
+        config.TRANSFORMER_SELF_ATTN_LAYERS = trial.suggest_int(
+            "self_attn_layers", 2, 3 if getattr(config, "_search_profile", None) == "transformer_v2" else 4
+        )
         config.TRANSFORMER_CROSS_ATTN_LAYERS = trial.suggest_int("cross_attn_layers", 1, 2)
         config.TRANSFORMER_PATCH_SIZE = 32
     else:
@@ -583,7 +610,7 @@ def build_cli_command_hint(model_name: str, params: dict, epochs: int = 30) -> s
         flags.append(f"--num-heads {params['num_heads']}")
         flags.append(f"--self-attn-layers {params['self_attn_layers']}")
         flags.append(f"--cross-attn-layers {params['cross_attn_layers']}")
-        flags.append(f"--patch-size {params['patch_size']}")
+        flags.append(f"--patch-size {params.get('patch_size', 32)}")
         flags.append(f"--dim-feedforward {ff_dim}")
         flags.append(f"--attn-entropy-weight {params['attn_entropy_weight']:.4f}")
 
@@ -638,6 +665,22 @@ def main():
     print(f"Num Subjects Used   : {args.num_subjects or 'ALL (32)'}", flush=True)
     print(f"Trials/Subject      : {args.trials_per_subject or 'ALL (40)'}", flush=True)
     print("=" * 80, flush=True)
+
+    if (
+        args.model == "cross_attention_transformer"
+        and args.search_profile == "transformer_refine"
+        and not args.cache_path
+    ):
+        raise ValueError(
+            "transformer_refine requires --cache-path so the search cannot "
+            "silently rerun preprocessing."
+        )
+
+    if args.cache_path and not Path(args.cache_path).is_file():
+        raise FileNotFoundError(
+            f"Cache file not found: {args.cache_path}. "
+            "Provide the verified preprocessed pickle cache."
+        )
 
     print("\nRunning data pipeline ΜΙΑ ΦΟΡΑ (θα ξαναχρησιμοποιηθεί σε ΟΛΑ τα trials)...\n", flush=True)
 

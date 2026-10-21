@@ -41,8 +41,7 @@ class SubjectSplitter:
     ):
 
         self.random_seed = random_seed
-
-        random.seed(random_seed)
+        self._rng = random.Random(random_seed)
 
     # ---------------------------------------------------------
     # Train / Validation / Test Split
@@ -102,7 +101,7 @@ class SubjectSplitter:
 
         if shuffle:
 
-            random.shuffle(subjects)
+            self._rng.shuffle(subjects)
 
         n_subjects = len(subjects)
 

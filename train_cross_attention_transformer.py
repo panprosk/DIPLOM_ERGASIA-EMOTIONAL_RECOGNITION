@@ -408,6 +408,14 @@ def run_epoch(
         "subject_metrics": hierarchical_metrics["subject_metrics"],
         "trial_preds": hierarchical_metrics["trial_predictions"],
         "trial_labels": hierarchical_metrics["trial_labels"],
+        # Εκτίθενται επιπλέον (πέρα από trial_preds/trial_labels) ώστε ένα
+        # CV/LOSO harness (βλ. train_cross_attention_transformer_cv.py) να
+        # μπορεί να συγκεντρώσει (pool) τις out-of-fold trial-level
+        # προβλέψεις όλων των folds, ανά subject/trial, για ένα ενιαίο
+        # cross-subject evaluation πάνω σε ΟΛΟ το dataset.
+        "trial_probabilities": hierarchical_metrics["trial_probabilities"],
+        "trial_subjects": hierarchical_metrics["trial_subjects"],
+        "trial_ids": hierarchical_metrics["trial_ids"],
         "cross_attn_mean": float(attn_values.mean()),
         "preds": all_preds,
         "labels": all_labels,

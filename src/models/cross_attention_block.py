@@ -76,12 +76,24 @@ class CrossAttentionBlock(nn.Module):
         self.eeg_norm2 = nn.LayerNorm(d_model)
         self.physio_norm2 = nn.LayerNorm(d_model)
 
-    def forward(self, eeg_tokens: torch.Tensor, physio_tokens: torch.Tensor):
+    def forward(
+        self,
+        eeg_tokens: torch.Tensor,
+        physio_tokens: torch.Tensor,
+        physio_key_padding_mask: torch.Tensor | None = None,
+    ):
         """
         Parameters
         ----------
         eeg_tokens    : (batch, n_eeg_patches, d_model)
         physio_tokens : (batch, n_physio_patches, d_model)
+        physio_key_padding_mask : (batch, n_physio_patches) bool, προαιρετικό.
+            True = padding token (να αγνοηθεί). Χρησιμοποιείται ΜΟΝΟ στο
+            eeg-attends-physio attention (physio ως key/value), ώστε το
+            EEG να μην "βλέπει" τεχνητά zero-padding physio patches σαν
+            πραγματικό σήμα (item 8 του review). Προαιρετικό/additive --
+            δεν επηρεάζει το ήδη calibrated CrossAttentionTransformer
+            (CAT) που δεν περνάει ποτέ αυτό το όρισμα (παραμένει None).
 
         Returns
         -------
@@ -90,7 +102,8 @@ class CrossAttentionBlock(nn.Module):
         """
 
         eeg_attended, eeg_to_physio_attn = self.eeg_attends_physio(
-            query=eeg_tokens, key=physio_tokens, value=physio_tokens
+            query=eeg_tokens, key=physio_tokens, value=physio_tokens,
+            key_padding_mask=physio_key_padding_mask,
         )
         eeg_out = self.eeg_norm1(eeg_tokens + eeg_attended)
         eeg_out = self.eeg_norm2(eeg_out + self.eeg_ff(eeg_out))

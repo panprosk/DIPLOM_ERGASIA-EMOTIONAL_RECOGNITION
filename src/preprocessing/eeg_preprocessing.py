@@ -29,6 +29,7 @@ class EEGPreprocessor(BasePreprocessor):
         signal: np.ndarray,
         subject_mean: np.ndarray | None = None,
         subject_std: np.ndarray | None = None,
+        normalize: bool = True,
     ) -> np.ndarray:
 
         signal = remove_linear_trend(signal)
@@ -42,6 +43,9 @@ class EEGPreprocessor(BasePreprocessor):
 
         if self.use_notch:
             signal = notch_filter(signal, fs=self.fs)
+
+        if not normalize:
+            return signal.astype(np.float32)
 
         if subject_mean is not None and subject_std is not None:
             signal = (signal - subject_mean) / (subject_std + 1e-8)

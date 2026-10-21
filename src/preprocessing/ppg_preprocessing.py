@@ -20,6 +20,7 @@ class PPGPreprocessor(BasePreprocessor):
         signal: np.ndarray,
         subject_mean: float | np.ndarray | None = None,
         subject_std: float | np.ndarray | None = None,
+        normalize: bool = True,
     ) -> np.ndarray:
 
         if not isinstance(signal, np.ndarray):
@@ -40,6 +41,9 @@ class PPGPreprocessor(BasePreprocessor):
 
         # Reshape back to (1, samples) for consistent multi-channel logic
         cleaned = cleaned[np.newaxis, :]
+
+        if not normalize:
+            return cleaned.astype(np.float32)
 
         # Normalization
         if subject_mean is not None and subject_std is not None:

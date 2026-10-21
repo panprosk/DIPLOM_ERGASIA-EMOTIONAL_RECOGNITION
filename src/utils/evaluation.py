@@ -23,6 +23,7 @@ def evaluate_hierarchical_predictions(
     labels: np.ndarray,
     subjects: np.ndarray,
     trials: np.ndarray,
+    decision_threshold: float = 0.5,
 ) -> dict:
     """
     Computes evaluation metrics at three levels.
@@ -40,10 +41,12 @@ def evaluate_hierarchical_predictions(
 
     if probabilities.ndim != 2 or probabilities.shape[1] != 2:
         raise ValueError("probabilities must have shape (n_samples, 2).")
+    if not 0.0 < decision_threshold < 1.0:
+        raise ValueError("decision_threshold must be between 0 and 1.")
     if not (len(probabilities) == len(labels) == len(subjects) == len(trials)):
         raise ValueError("probabilities, labels, subjects, and trials must have equal length.")
 
-    window_predictions = probabilities.argmax(axis=1)
+    window_predictions = (probabilities[:, 1] >= decision_threshold).astype(np.int64)
     window_metrics = _classification_metrics(labels, window_predictions)
 
     grouped = defaultdict(list)
@@ -67,7 +70,9 @@ def evaluate_hierarchical_predictions(
 
     trial_probabilities = np.asarray(trial_probabilities)
     trial_labels = np.asarray(trial_labels, dtype=np.int64)
-    trial_predictions = trial_probabilities.argmax(axis=1)
+    trial_predictions = (
+        trial_probabilities[:, 1] >= decision_threshold
+    ).astype(np.int64)
     trial_subjects = np.asarray(trial_subjects)
     trial_ids = np.asarray(trial_ids, dtype=np.int64)
     trial_metrics = _classification_metrics(trial_labels, trial_predictions)

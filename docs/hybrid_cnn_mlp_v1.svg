@@ -1,0 +1,90 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="1500" height="930" viewBox="0 0 1500 930">
+  <defs>
+    <marker id="arrow" markerWidth="10" markerHeight="10" refX="9" refY="3" orient="auto" markerUnits="strokeWidth">
+      <path d="M0,0 L0,6 L9,3 z" fill="#334155"/>
+    </marker>
+    <style>
+      .title { font: 700 28px Arial, sans-serif; fill: #0f172a; }
+      .label { font: 700 17px Arial, sans-serif; fill: #0f172a; }
+      .text { font: 15px Arial, sans-serif; fill: #334155; }
+      .small { font: 13px Arial, sans-serif; fill: #475569; }
+      .box { stroke-width: 2; rx: 12; }
+      .input { fill: #e0f2fe; stroke: #0284c7; }
+      .encoder { fill: #ede9fe; stroke: #7c3aed; }
+      .fusion { fill: #dcfce7; stroke: #16a34a; }
+      .head { fill: #ffedd5; stroke: #ea580c; }
+      .aux { fill: #f1f5f9; stroke: #64748b; }
+      .arrow { stroke: #334155; stroke-width: 2.4; fill: none; marker-end: url(#arrow); }
+      .dash { stroke-dasharray: 8 6; }
+    </style>
+  </defs>
+
+  <rect width="1500" height="930" fill="#ffffff"/>
+  <text x="750" y="48" text-anchor="middle" class="title">Hybrid CNN-MLP v1 Architecture</text>
+  <text x="750" y="76" text-anchor="middle" class="small">Dual EEG representation + physiological branch + gated fusion</text>
+
+  <rect x="55" y="150" width="210" height="76" class="box input"/>
+  <text x="160" y="181" text-anchor="middle" class="label">Raw EEG</text>
+  <text x="160" y="205" text-anchor="middle" class="text">(B, channels, samples)</text>
+
+  <rect x="55" y="315" width="210" height="76" class="box input"/>
+  <text x="160" y="346" text-anchor="middle" class="label">EEG handcrafted</text>
+  <text x="160" y="370" text-anchor="middle" class="text">band powers / features</text>
+
+  <rect x="55" y="480" width="210" height="76" class="box input"/>
+  <text x="160" y="511" text-anchor="middle" class="label">EDA + PPG features</text>
+  <text x="160" y="535" text-anchor="middle" class="text">physiological vector</text>
+
+  <rect x="355" y="150" width="255" height="76" class="box encoder"/>
+  <text x="482" y="181" text-anchor="middle" class="label">EEGCNNEncoder</text>
+  <text x="482" y="205" text-anchor="middle" class="text">1D CNN + pooling -&gt; 128</text>
+
+  <rect x="355" y="315" width="255" height="76" class="box encoder"/>
+  <text x="482" y="346" text-anchor="middle" class="label">EEGHandcraftedEncoder</text>
+  <text x="482" y="370" text-anchor="middle" class="text">MLP -&gt; 128</text>
+
+  <rect x="690" y="225" width="255" height="112" class="box fusion"/>
+  <text x="817" y="260" text-anchor="middle" class="label">EEG Fusion</text>
+  <text x="817" y="286" text-anchor="middle" class="text">Concatenate [128 + 128]</text>
+  <text x="817" y="310" text-anchor="middle" class="text">Linear -&gt; ReLU -&gt; Dropout</text>
+  <text x="817" y="332" text-anchor="middle" class="small">EEG embedding (128)</text>
+
+  <rect x="355" y="480" width="255" height="76" class="box encoder"/>
+  <text x="482" y="511" text-anchor="middle" class="label">PhysioMLPEncoder</text>
+  <text x="482" y="535" text-anchor="middle" class="text">MLP -&gt; 128</text>
+
+  <rect x="1015" y="300" width="255" height="112" class="box fusion"/>
+  <text x="1142" y="335" text-anchor="middle" class="label">Gated Attention Fusion</text>
+  <text x="1142" y="361" text-anchor="middle" class="text">EEG + physiological</text>
+  <text x="1142" y="385" text-anchor="middle" class="text">residual + LayerNorm</text>
+  <text x="1142" y="407" text-anchor="middle" class="small">fused embedding (128)</text>
+
+  <rect x="1335" y="300" width="120" height="112" class="box head"/>
+  <text x="1395" y="335" text-anchor="middle" class="label">Classifier</text>
+  <text x="1395" y="361" text-anchor="middle" class="small">128 -&gt; 64</text>
+  <text x="1395" y="382" text-anchor="middle" class="small">-&gt; classes</text>
+  <text x="1395" y="404" text-anchor="middle" class="small">Softmax</text>
+
+  <rect x="1015" y="560" width="255" height="82" class="box aux"/>
+  <text x="1142" y="592" text-anchor="middle" class="label">Contrastive projection</text>
+  <text x="1142" y="617" text-anchor="middle" class="text">MLP -&gt; 64-dimensional space</text>
+
+  <rect x="1015" y="720" width="255" height="82" class="box aux"/>
+  <text x="1142" y="752" text-anchor="middle" class="label">Subject classifier</text>
+  <text x="1142" y="777" text-anchor="middle" class="text">Gradient Reversal (optional)</text>
+
+  <path d="M265 188 L355 188" class="arrow"/>
+  <path d="M265 353 L355 353" class="arrow"/>
+  <path d="M265 518 L355 518" class="arrow"/>
+  <path d="M610 188 L650 188 L650 260 L690 260" class="arrow"/>
+  <path d="M610 353 L650 353 L650 302 L690 302" class="arrow"/>
+  <path d="M945 281 L980 281 L980 350 L1015 350" class="arrow"/>
+  <path d="M610 518 L980 518 L980 390 L1015 390" class="arrow"/>
+  <path d="M1270 356 L1335 356" class="arrow"/>
+  <path d="M1142 412 L1142 560" class="arrow dash"/>
+  <path d="M1142 412 L1142 720" class="arrow dash"/>
+
+  <text x="75" y="875" class="small">Main path: classification</text>
+  <line x1="260" y1="870" x2="320" y2="870" class="arrow"/>
+  <text x="355" y="875" class="small">Dashed paths: optional auxiliary objectives</text>
+</svg>

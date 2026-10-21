@@ -82,7 +82,7 @@ def parse_args():
                          help="Μέγεθος παραθύρου windowing σε δευτερόλεπτα "
                               "(overrides config.WINDOW_SIZE). Default "
                               "config: 6s. Βιβλιογραφία (DEAP cross-subject "
-                              "emotion recognition) προτείνει 2-5s με ~50% "
+                              "emotion recognition) προτείνει 2-5s με ~50%% "
                               "overlap ως καλύτερο συμβιβασμό ανάμεσα σε "
                               "context και pseudo-replication/redundancy.")
     parser.add_argument("--overlap", type=float, default=None,
@@ -151,7 +151,7 @@ def parse_args():
                               "Test Trial F1 ήταν σαφώς χειρότερο (0.4377, "
                               "0.4233) σε σχέση με το καλύτερο run χωρίς "
                               "margin (0.5666) -- πιθανώς επειδή αφαιρεί "
-                              "15-50% των trials ανά subject, μειώνοντας "
+                              "15-50%% των trials ανά subject, μειώνοντας "
                               "πολύ το ήδη μικρό training set. Δώσε π.χ. "
                               "--valence-margin 1.0 μόνο αν θες να το "
                               "ξαναδοκιμάσεις ρητά (π.χ. με περισσότερα "
@@ -217,6 +217,32 @@ def parse_args():
                               "του averaged μοντέλου είναι >= του single-best "
                               "(ποτέ δεν χειροτερεύει το αποτέλεσμα). "
                               "Θέσε 0 ή 1 για να το απενεργοποιήσεις.")
+    parser.add_argument("--wandb", action="store_true",
+                         help="Ενεργοποιεί logging των metrics στο W&B.")
+    parser.add_argument("--wandb-project", type=str,
+                         default="deap-hybrid-cnn-mlp",
+                         help="W&B project name.")
+    parser.add_argument("--wandb-run-name", type=str, default=None,
+                         help="Προαιρετικό W&B run name.")
+    parser.add_argument("--seed", type=int, default=None,
+                         help="Overrides the training/data random seed.")
+    parser.add_argument("--legacy-v1", action="store_true",
+                         help="Τρέχει το παλιό Hybrid v1 (legacy preprocessing "
+                              "+ HybridCNNMLP). Default: v2 (official DEAP "
+                              "preprocessing + HybridCNNMLPv2).")
+    parser.add_argument("--enable-adversarial", action="store_true",
+                         help="(v2) Ενεργοποιεί το domain-adversarial head "
+                              "(default OFF στο v2).")
+    parser.add_argument("--enable-contrastive", action="store_true",
+                         help="(v2) Ενεργοποιεί το supervised contrastive "
+                              "loss (default OFF στο v2).")
+    parser.add_argument("--checkpoint-name", type=str, default=None,
+                         help="Όνομα αρχείου checkpoint μέσα στο OUTPUT_DIR. "
+                              "Default: hybrid_cnn_mlp_v2.pt (v2) / "
+                              "hybrid_cnn_mlp_regularized.pt (v1).")
+    parser.add_argument("--no-threshold-calibration", action="store_true",
+                         help="Κρατά το ουδέτερο decision threshold 0.50 "
+                              "αντί να το επιλέξει από το validation set.")
 
     return parser.parse_args()
 
@@ -368,6 +394,7 @@ def run_epoch(
     contrastive_weight: float = 0.0,
     mixup_alpha: float = 0.0,
     gate_balance_weight: float = 0.0,
+    decision_threshold: float = 0.5,
     heartbeat_every: int = 20,
     heartbeat_label: str = "",
 ):
@@ -497,7 +524,7 @@ def run_epoch(
             total_task_loss += task_loss.item() * labels.size(0)
             total_subject_loss += subject_loss_value * labels.size(0)
 
-            preds = out["logits"].argmax(dim=-1)
+            preds = (out["probs"][:, 1] >= decision_threshold).long()
 
             all_preds.append(preds.detach().cpu().numpy())
             all_labels.append(labels.detach().cpu().numpy())
@@ -527,6 +554,7 @@ def run_epoch(
         labels=all_labels,
         subjects=np.asarray(all_subjects),
         trials=all_trials,
+        decision_threshold=decision_threshold,
     )
 
     n = len(all_labels)
@@ -553,6 +581,10 @@ def run_epoch(
         "eeg_gate_mean": float(gate_values.mean()),
         "preds": all_preds,
         "labels": all_labels,
+        "probabilities": all_probs,
+        "subjects": np.asarray(all_subjects),
+        "trials": all_trials,
+        "decision_threshold": decision_threshold,
     }
 
 
@@ -577,6 +609,25 @@ def main():
     # συγκλίνει πλήρως. Ίδιο patience με τον Cross-Attention Transformer.
     config.EARLY_STOPPING_PATIENCE = 15
 
+    use_v2 = not args.legacy_v1
+
+    if use_v2:
+        config.PREPROCESSING_VERSION = "v2"
+        config.HYBRID_VERSION = "v2"
+        config.EEG_HANDCRAFTED_DIM = 256
+        config.DROPOUT = 0.30
+        config.TRAIN_ONLY_POPULATION_NORMALIZATION = False
+        args.no_adversarial = not args.enable_adversarial
+        args.no_contrastive = not args.enable_contrastive
+        if args.no_eeg_handcrafted:
+            config.EEG_HANDCRAFTED_DIM = None
+        if args.cache_path is None and args.num_subjects is None \
+                and args.trials_per_subject is None:
+            args.cache_path = str(config.OUTPUT_DIR / "hybrid_cache_official_v2.pkl")
+
+    checkpoint_name = args.checkpoint_name or (
+        "hybrid_cnn_mlp_v2.pt" if use_v2 else "hybrid_cnn_mlp_regularized.pt"
+    )
     if args.batch_size is not None:
         config.BATCH_SIZE = args.batch_size
 
@@ -616,12 +667,29 @@ def main():
     if args.no_eeg_handcrafted:
         config.EEG_HANDCRAFTED_DIM = None
 
+    if args.seed is not None:
+        config.SEED = args.seed
+        config.RANDOM_SEED = args.seed
     torch.manual_seed(config.SEED)
     np.random.seed(config.SEED)
 
     device = torch.device(
         "cuda" if (config.DEVICE == "cuda" and torch.cuda.is_available()) else "cpu"
     )
+
+    wandb_run = None
+    if args.wandb:
+        try:
+            import wandb
+        except ImportError as exc:
+            raise RuntimeError(
+                "W&B logging requested but wandb is not installed."
+            ) from exc
+        wandb_run = wandb.init(
+            project=args.wandb_project,
+            name=args.wandb_run_name,
+            config=vars(args),
+        )
 
     # pin_memory μόνο ωφελεί όταν μεταφέρουμε tensors σε GPU (CUDA).
     # Σε CPU-only training (όπως εδώ), pin_memory=True απλά "κλειδώνει"
@@ -737,7 +805,7 @@ def main():
     # το plain parameter-wise mean είναι απευθείας valid.
     topk_checkpoints = []  # list of (val_trial_f1, state_dict_cpu)
 
-    checkpoint_path = config.OUTPUT_DIR / "hybrid_cnn_mlp_regularized.pt"
+    checkpoint_path = config.OUTPUT_DIR / checkpoint_name
 
     for epoch in range(1, args.epochs + 1):
 
@@ -810,6 +878,28 @@ def main():
             f" | smoothT.F1={smoothed_val_f1:.4f}",
             flush=True,
         )
+
+        if wandb_run is not None:
+            wandb_run.log(
+                {
+                    "epoch": epoch,
+                    "train/loss": train_metrics["loss"],
+                    "train/accuracy": train_metrics["accuracy"],
+                    "train/f1": train_metrics["f1"],
+                    "val/loss": val_metrics["loss"],
+                    "val/accuracy": val_metrics["accuracy"],
+                    "val/window_f1": val_metrics["f1"],
+                    "val/trial_accuracy": val_metrics["trial_accuracy"],
+                    "val/trial_f1": val_metrics["trial_f1"],
+                    "val/subject_f1_mean": val_metrics["subject_f1_mean"],
+                    "val/worst_subject_f1": val_metrics["worst_subject_f1"],
+                    "model/eeg_gate_mean": val_metrics["eeg_gate_mean"],
+                    "optimizer/learning_rate": current_lr,
+                    "regularization/subject_loss": train_metrics["subject_loss"],
+                    "selection/smoothed_val_trial_f1": smoothed_val_f1,
+                },
+                step=epoch,
+            )
 
         if smoothed_val_f1 > best_val_f1:
             best_val_f1 = smoothed_val_f1
@@ -903,8 +993,46 @@ def main():
     if best_state is not None:
         model.load_state_dict(best_state)
 
+    best_threshold = 0.5
+    if args.no_threshold_calibration:
+        print(
+            "Validation threshold calibration: disabled "
+            "(decision threshold=0.50)",
+            flush=True,
+        )
+    else:
+        # Calibrate only on validation trials; test labels remain untouched.
+        validation_calibration = run_epoch(
+            model, validation_loader, criterion, optimizer, device, train=False,
+            heartbeat_label="calibration ",
+        )
+        threshold_candidates = np.arange(0.30, 0.701, 0.01)
+        best_threshold_f1 = -1.0
+        for threshold in threshold_candidates:
+            calibrated_metrics = evaluate_hierarchical_predictions(
+                probabilities=validation_calibration["probabilities"],
+                labels=validation_calibration["labels"],
+                subjects=validation_calibration["subjects"],
+                trials=validation_calibration["trials"],
+                decision_threshold=float(threshold),
+            )
+            candidate_f1 = calibrated_metrics["trial"]["f1"]
+            if candidate_f1 > best_threshold_f1 or (
+                candidate_f1 == best_threshold_f1
+                and abs(float(threshold) - 0.5) < abs(best_threshold - 0.5)
+            ):
+                best_threshold = float(threshold)
+                best_threshold_f1 = candidate_f1
+
+        print(
+            f"Validation threshold calibration: threshold={best_threshold:.2f}, "
+            f"Val Trial-F1={best_threshold_f1:.4f}",
+            flush=True,
+        )
+
     test_metrics = run_epoch(
-        model, test_loader, criterion, optimizer, device, train=False
+        model, test_loader, criterion, optimizer, device, train=False,
+        decision_threshold=best_threshold,
     )
 
     cm = confusion_matrix(test_metrics["labels"], test_metrics["preds"])
@@ -923,6 +1051,7 @@ def main():
     print(f"Window F1 (macro): {test_metrics['f1']:.4f}")
     print(f"Trial Accuracy   : {test_metrics['trial_accuracy']:.4f}")
     print(f"Trial F1 (macro) : {test_metrics['trial_f1']:.4f}")
+    print(f"Decision Threshold: {best_threshold:.2f}")
     print(f"Subject Trial-F1 : {test_metrics['subject_f1_mean']:.4f} ± {test_metrics['subject_f1_std']:.4f}")
     print(f"Worst Subject F1 : {test_metrics['worst_subject_f1']:.4f}")
     print(f"EEG Gate Mean    : {test_metrics['eeg_gate_mean']:.4f}")
@@ -941,7 +1070,7 @@ def main():
     if not args.no_save:
 
         config.OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
-        checkpoint_path = config.OUTPUT_DIR / "hybrid_cnn_mlp_regularized.pt"
+        checkpoint_path = config.OUTPUT_DIR / checkpoint_name
 
         torch.save(
             {
@@ -950,11 +1079,26 @@ def main():
                 "test_accuracy": test_metrics["accuracy"],
                 "test_window_f1": test_metrics["f1"],
                 "test_trial_f1": test_metrics["trial_f1"],
+                "decision_threshold": best_threshold,
             },
             checkpoint_path,
         )
 
         print(f"\nModel checkpoint saved to: {checkpoint_path}")
+
+    if wandb_run is not None:
+        wandb_run.summary.update(
+            {
+                "test/accuracy": test_metrics["accuracy"],
+                "test/window_f1": test_metrics["f1"],
+                "test/trial_accuracy": test_metrics["trial_accuracy"],
+                "test/trial_f1": test_metrics["trial_f1"],
+                "test/subject_f1_mean": test_metrics["subject_f1_mean"],
+                "test/worst_subject_f1": test_metrics["worst_subject_f1"],
+                "test/decision_threshold": best_threshold,
+            }
+        )
+        wandb_run.finish()
 
 
 if __name__ == "__main__":

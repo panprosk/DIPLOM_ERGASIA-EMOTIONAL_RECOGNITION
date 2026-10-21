@@ -28,6 +28,7 @@ class EDAPreprocessor(BasePreprocessor):
         signal: np.ndarray,
         subject_mean: float | np.ndarray | None = None,
         subject_std: float | np.ndarray | None = None,
+        normalize: bool = True,
     ) -> np.ndarray:
 
         if signal.ndim == 1:
@@ -46,6 +47,9 @@ class EDAPreprocessor(BasePreprocessor):
             sigma=self.sigma,
             axis=-1,
         )
+
+        if not normalize:
+            return signal.astype(np.float32)
 
         # Normalization
         if subject_mean is not None and subject_std is not None:

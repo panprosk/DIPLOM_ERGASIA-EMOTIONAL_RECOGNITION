@@ -1,4 +1,5 @@
 from src.models.hybrid_cnn_mlp import HybridCNNMLP
+from src.models.hybrid_cnn_mlp_v2 import HybridCNNMLPv2
 from src.models.eeg_cnn_encoder import EEGCNNEncoder
 from src.models.eeg_handcrafted_encoder import EEGHandcraftedEncoder
 from src.models.physio_mlp_encoder import PhysioMLPEncoder
@@ -9,6 +10,7 @@ from src.models.model_factory import build_model
 
 __all__ = [
     "HybridCNNMLP",
+    "HybridCNNMLPv2",
     "EEGCNNEncoder",
     "EEGHandcraftedEncoder",
     "PhysioMLPEncoder",

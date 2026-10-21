@@ -84,6 +84,12 @@ class Config:
 
     MODEL_NAME: str = "hybrid"
 
+    # "v1": legacy Hybrid CNN-MLP + legacy preprocessing (αναπαραγώγιμο
+    # baseline). "v2": official-DEAP preprocessing + HybridCNNMLPv2.
+    # Ο trainer train_hybrid_baseline.py επιλέγει v2 by default.
+    PREPROCESSING_VERSION: str = "v1"
+    HYBRID_VERSION: str = "v1"
+
     EMBEDDING_DIM: int = 128
 
     PHYSIO_FEATURE_DIM: int = 22  # EDA (12) + PPG (10) handcrafted features
@@ -153,6 +159,11 @@ class Config:
     EDA_GAUSSIAN_SIGMA: float = 1.0
 
     SUBJECT_WISE_NORMALIZATION: bool = True
+
+    # Research variant: use train-only population statistics for all
+    # subjects. It is kept opt-in because the first matched Hybrid run
+    # underperformed the established cache baseline.
+    TRAIN_ONLY_POPULATION_NORMALIZATION: bool = False
 
     # Τα πρώτα 3 δευτερόλεπτα κάθε DEAP trial είναι pre-stimulus
     # ("ήρεμη") καταγραφή, πριν ξεκινήσει το video. Αφαιρούμε τον μέσο

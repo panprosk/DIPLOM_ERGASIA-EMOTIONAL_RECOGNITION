@@ -1,4 +1,5 @@
 from src.models.hybrid_cnn_mlp import HybridCNNMLP
+from src.models.hybrid_cnn_mlp_v2 import HybridCNNMLPv2
 from src.models.cross_attention_transformer import CrossAttentionTransformer
 
 
@@ -21,6 +22,20 @@ def build_model(model_name: str, config, num_subjects: int | None = None):
         (όχι μέσω config) — υπολογίζεται από τα πραγματικά subjects
         του train split.
     """
+
+    if model_name == "hybrid_v2" or (
+        model_name == "hybrid" and getattr(config, "HYBRID_VERSION", "v1") == "v2"
+    ):
+
+        return HybridCNNMLPv2(
+            eeg_channels=config.EEG_CHANNELS,
+            physio_feature_dim=getattr(config, "PHYSIO_FEATURE_DIM", 22),
+            embedding_dim=getattr(config, "EMBEDDING_DIM", 96),
+            num_classes=config.NUM_CLASSES,
+            dropout=config.DROPOUT,
+            eeg_handcrafted_dim=getattr(config, "EEG_HANDCRAFTED_DIM", None),
+            num_subjects=num_subjects,
+        )
 
     if model_name == "hybrid":
 
