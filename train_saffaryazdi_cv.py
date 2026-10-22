@@ -23,6 +23,8 @@ estimated on genuinely unseen subjects and does not depend on a single
 from __future__ import annotations
 
 import argparse
+import copy
+import itertools
 import json
 import logging
 import random
@@ -154,6 +156,23 @@ def parse_args():
         default="",
         help="Comma-separated extra seeds averaged inside each fold (e.g. 42,7,2026).",
     )
+    parser.add_argument(
+        "--task-ensemble",
+        action="store_true",
+        help="Train LSTM pooling candidates and select task-specific validation weights.",
+    )
+    parser.add_argument(
+        "--task-ensemble-poolings",
+        type=str,
+        default="last,mean,attention",
+        help="Comma-separated LSTM pooling modes used by --task-ensemble.",
+    )
+    parser.add_argument(
+        "--task-ensemble-step",
+        type=float,
+        default=0.1,
+        help="Weight-grid step for task ensemble selection.",
+    )
     parser.add_argument("--folds", type=int, default=5)
     parser.add_argument(
         "--protocol",
@@ -213,6 +232,54 @@ def generalization_score(result: dict) -> float:
         + 0.3 * result["worst_subject_f1"]
         - 0.2 * result["subject_f1_std"]
     )
+
+
+def _ensemble_weights(count: int, step: float):
+    if count < 1:
+        raise ValueError("Task ensemble requires at least one candidate.")
+    units = int(round(1.0 / step))
+    if units < 1 or not np.isclose(units * step, 1.0, atol=1e-6):
+        raise ValueError("--task-ensemble-step must divide 1.0 exactly.")
+    for values in itertools.product(range(units + 1), repeat=count - 1):
+        remainder = units - sum(values)
+        if remainder < 0:
+            continue
+        yield np.asarray((*values, remainder), dtype=np.float64) / units
+
+
+def select_task_ensemble(
+    validation_probabilities,
+    test_probabilities,
+    labels,
+    subjects,
+    selection,
+    step,
+):
+    best = None
+    for weights in _ensemble_weights(len(validation_probabilities), step):
+        validation_probs = sum(
+            weight * probabilities
+            for weight, probabilities in zip(weights, validation_probabilities)
+        )
+        validation_metrics = metrics(
+            validation_probs.argmax(axis=1), labels, subjects
+        )
+        score = (
+            generalization_score(validation_metrics)
+            if selection == "subject_g"
+            else validation_metrics["macro_f1"]
+        )
+        candidate = (score, validation_metrics["macro_f1"], weights, validation_metrics)
+        if best is None or candidate[:2] > best[:2]:
+            best = candidate
+    if best is None:
+        raise RuntimeError("Task ensemble selection produced no candidate weights.")
+    _, _, weights, validation_metrics = best
+    test_probs = sum(
+        weight * probabilities
+        for weight, probabilities in zip(weights, test_probabilities)
+    )
+    return weights, validation_metrics, test_probs
 
 
 def build_folds(subject_ids, args):
@@ -782,104 +849,197 @@ def main():
             test_loader = make_loader(
                 arrays["test"], task, args.batch_size, False, subject_map
             )
-            seed_probabilities = []
-            seed_labels = None
-            seed_subjects = arrays["test"]["subjects"]
-            seed_trials = arrays["test"]["trials"]
-            fold_alphas = []
-            for seed in seeds:
-                set_seed(seed)
-                model = create_model(arrays, subject_map, args, device)
-                model, _ = train_fold_task(
-                    model,
-                    train_loader,
-                    val_loader,
-                    arrays["train"][task],
-                    arrays["validation"]["subjects"],
-                    args,
-                    device,
+            candidate_names = (
+                [
+                    f"lstm:{pooling.strip()}"
+                    for pooling in args.task_ensemble_poolings.split(",")
+                    if pooling.strip()
+                ]
+                if args.task_ensemble
+                else [args.temporal_encoder]
+            )
+            valid_poolings = {"last", "mean", "attention", "attention_residual"}
+            requested_poolings = {
+                name.split(":", 1)[1] for name in candidate_names if ":" in name
+            }
+            invalid_poolings = requested_poolings - valid_poolings
+            if not candidate_names or invalid_poolings:
+                raise ValueError(
+                    "Invalid --task-ensemble-poolings: "
+                    + ", ".join(sorted(invalid_poolings or {"empty"}))
                 )
-                adapted_model, adapted_test = adapt_model(
-                    model, arrays, task, args, device
-                )
-                if args.adaptation != "none":
-                    seed_subjects = adapted_test["subjects"]
-                    seed_trials = adapted_test["trials"]
-                adapted_test_loader = make_loader(
-                    adapted_test, task, args.batch_size, False, subject_map
-                )
-                (
-                    test_probs,
-                    test_labels,
-                    val_result,
-                    alpha,
-                    val_probs,
-                    val_labels,
-                ) = fuse_test_probabilities(
-                    adapted_model,
-                    val_loader,
-                    adapted_test_loader,
-                    arrays["validation"]["subjects"],
-                    args,
-                    device,
-                )
-                temperature = 1.0
-                if args.temperature_scaling:
-                    temperature = fit_temperature(val_probs, val_labels)
-                    test_probs = apply_temperature(test_probs, temperature)
-                threshold = 0.5
-                if args.threshold_tuning:
-                    threshold = choose_decision_threshold(
+
+            candidate_val_probabilities = []
+            candidate_test_probabilities = []
+            candidate_names_used = []
+            candidate_alphas = []
+            final_labels = None
+            final_subjects = arrays["test"]["subjects"]
+            final_trials = arrays["test"]["trials"]
+
+            for candidate_name in candidate_names:
+                candidate_args = copy.copy(args)
+                if args.task_ensemble:
+                    candidate_args.temporal_encoder = "lstm"
+                    candidate_args.pooling = candidate_name.split(":", 1)[1]
+                seed_probabilities = []
+                seed_val_probabilities = []
+                seed_labels = None
+                seed_subjects = arrays["test"]["subjects"]
+                seed_trials = arrays["test"]["trials"]
+                fold_alphas = []
+
+                for seed in seeds:
+                    set_seed(seed)
+                    model = create_model(arrays, subject_map, candidate_args, device)
+                    model, _ = train_fold_task(
+                        model,
+                        train_loader,
+                        val_loader,
+                        arrays["train"][task],
+                        arrays["validation"]["subjects"],
+                        candidate_args,
+                        device,
+                    )
+                    adapted_model, adapted_test = adapt_model(
+                        model, arrays, task, candidate_args, device
+                    )
+                    if candidate_args.adaptation != "none":
+                        seed_subjects = adapted_test["subjects"]
+                        seed_trials = adapted_test["trials"]
+                    adapted_test_loader = make_loader(
+                        adapted_test, task, candidate_args.batch_size, False, subject_map
+                    )
+                    (
+                        test_probs,
+                        test_labels,
+                        val_result,
+                        alpha,
                         val_probs,
                         val_labels,
+                    ) = fuse_test_probabilities(
+                        adapted_model,
+                        val_loader,
+                        adapted_test_loader,
                         arrays["validation"]["subjects"],
-                    )[0]
-                seed_probabilities.append(test_probs)
-                seed_labels = test_labels
-                fold_alphas.append(alpha)
+                        candidate_args,
+                        device,
+                    )
+                    temperature = 1.0
+                    if candidate_args.temperature_scaling:
+                        temperature = fit_temperature(val_probs, val_labels)
+                        val_probs = apply_temperature(val_probs, temperature)
+                        test_probs = apply_temperature(test_probs, temperature)
+                    seed_probabilities.append(test_probs)
+                    seed_val_probabilities.append(val_probs)
+                    seed_labels = test_labels
+                    fold_alphas.append(alpha)
+                    logger.info(
+                        "[fold %d][%s][%s][seed %d] val_macro_f1=%.4f "
+                        "val_subject_f1=%.4f alpha=%s",
+                        fold["fold"],
+                        task,
+                        candidate_name,
+                        seed,
+                        val_result["macro_f1"],
+                        val_result["subject_f1_mean"],
+                        "learned" if alpha is None else f"{alpha:.2f}",
+                    )
+                    if wandb_run is not None:
+                        wandb_run.log(
+                            {
+                                f"{task}/{candidate_name}/fold": fold["fold"],
+                                f"{task}/{candidate_name}/seed": seed,
+                                f"{task}/{candidate_name}/validation_macro_f1": val_result[
+                                    "macro_f1"
+                                ],
+                                f"{task}/{candidate_name}/validation_subject_f1": val_result[
+                                    "subject_f1_mean"
+                                ],
+                                f"{task}/{candidate_name}/temperature": temperature,
+                            }
+                        )
+
+                candidate_val_probabilities.append(
+                    np.mean(seed_val_probabilities, axis=0)
+                )
+                candidate_test_probabilities.append(
+                    np.mean(seed_probabilities, axis=0)
+                )
+                candidate_names_used.append(candidate_name)
+                candidate_alphas.append(fold_alphas)
+                final_labels = seed_labels
+                final_subjects = seed_subjects
+                final_trials = seed_trials
+
+            ensemble_weights = np.array([1.0])
+            if args.task_ensemble:
+                (
+                    ensemble_weights,
+                    ensemble_val_metrics,
+                    ensemble_probs,
+                ) = select_task_ensemble(
+                    candidate_val_probabilities,
+                    candidate_test_probabilities,
+                    val_labels,
+                    arrays["validation"]["subjects"],
+                    args.fusion_selection,
+                    args.task_ensemble_step,
+                )
+                ensemble_val_probs = sum(
+                    weight * probabilities
+                    for weight, probabilities in zip(
+                        ensemble_weights, candidate_val_probabilities
+                    )
+                )
                 logger.info(
-                    "[fold %d][%s][seed %d] val_macro_f1=%.4f val_subject_f1=%.4f alpha=%s",
+                    "[fold %d][%s] task-ensemble candidates=%s weights=%s "
+                    "val_macro_f1=%.4f val_subject_f1=%.4f",
                     fold["fold"],
                     task,
-                    seed,
-                    val_result["macro_f1"],
-                    val_result["subject_f1_mean"],
-                    "learned" if alpha is None else f"{alpha:.2f}",
+                    ",".join(candidate_names_used),
+                    np.round(ensemble_weights, 2).tolist(),
+                    ensemble_val_metrics["macro_f1"],
+                    ensemble_val_metrics["subject_f1_mean"],
                 )
-                if wandb_run is not None:
-                    wandb_run.log(
-                        {
-                            f"{task}/fold": fold["fold"],
-                            f"{task}/seed": seed,
-                            f"{task}/validation_macro_f1": val_result["macro_f1"],
-                            f"{task}/validation_subject_f1": val_result[
-                                "subject_f1_mean"
-                            ],
-                            f"{task}/temperature": temperature,
-                            f"{task}/threshold": threshold,
-                        }
-                    )
-            ensemble_probs = np.mean(seed_probabilities, axis=0)
+            else:
+                ensemble_probs = candidate_test_probabilities[0]
+                ensemble_val_probs = candidate_val_probabilities[0]
+
+            threshold = 0.5
+            if args.threshold_tuning:
+                threshold = choose_decision_threshold(
+                    ensemble_val_probs,
+                    val_labels,
+                    arrays["validation"]["subjects"],
+                )[0]
             target_oof = adaptation_oof if args.adaptation != "none" else oof
             target_oof[task]["probs"].append(ensemble_probs)
-            target_oof[task]["labels"].append(seed_labels)
+            target_oof[task]["labels"].append(final_labels)
             target_oof[task]["subjects"].append(
-                adapted_test["subjects"] if args.adaptation != "none" else seed_subjects
+                final_subjects
             )
             target_oof[task]["trials"].append(
-                adapted_test["trials"] if args.adaptation != "none" else seed_trials
+                final_trials
             )
             target_oof[task]["thresholds"].append(
-                np.full(len(seed_labels), threshold, dtype=np.float32)
+                np.full(len(final_labels), threshold, dtype=np.float32)
+            )
+            fold_predictions = (
+                (ensemble_probs[:, 1] >= threshold).astype(np.int64)
+                if args.threshold_tuning
+                else ensemble_probs.argmax(axis=1)
             )
             fold_metrics = metrics(
-                ensemble_probs.argmax(axis=1), seed_labels, seed_subjects
+                fold_predictions, final_labels, final_subjects
             )
             fold_summary["tasks"][task] = {
                 "macro_f1": fold_metrics["macro_f1"],
                 "subject_f1_mean": fold_metrics["subject_f1_mean"],
                 "worst_subject_f1": fold_metrics["worst_subject_f1"],
-                "alphas": fold_alphas,
+                "candidates": candidate_names_used,
+                "ensemble_weights": ensemble_weights.tolist(),
+                "alphas": candidate_alphas,
             }
             logger.info(
                 "[fold %d][%s] OOF macro_f1=%.4f subject_f1=%.4f worst=%.4f",
